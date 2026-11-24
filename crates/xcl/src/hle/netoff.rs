@@ -50,6 +50,8 @@ extern "system" {
     fn real_sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
     #[link_name = "WSASendMsg"]
     fn real_wsa_send_msg(s: usize, msg: *const c_void, flags: u32, sent: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32;
+    #[link_name = "WSASendTo"]
+    fn real_wsa_send_to(s: usize, bufs: *const c_void, n: u32, sent: *mut u32, flags: u32, to: *const u8, tolen: i32, ov: *mut c_void, cb: *const c_void) -> i32;
     fn WSASetLastError(e: i32);
     #[link_name = "getaddrinfo"]
     fn real_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32;
@@ -136,6 +138,7 @@ unsafe fn unreachable_net(what: &str) -> i32 {
 static O_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_WSA_SEND_MSG: AtomicUsize = AtomicUsize::new(0);
+static O_WSA_SEND_TO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
@@ -184,6 +187,13 @@ unsafe fn orig_wsa_send_msg(s: usize, msg: *const c_void, flags: u32, sent: *mut
     }
 }
 
+unsafe fn orig_wsa_send_to(s: usize, bufs: *const c_void, n: u32, sent: *mut u32, flags: u32, to: *const u8, tolen: i32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    match O_WSA_SEND_TO.load(Ordering::Acquire) {
+        0 => real_wsa_send_to(s, bufs, n, sent, flags, to, tolen, ov, cb),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32>(f)(s, bufs, n, sent, flags, to, tolen, ov, cb),
+    }
+}
+
 unsafe fn orig_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32 {
     match O_GETADDRINFO.load(Ordering::Acquire) {
         0 => real_getaddrinfo(node, service, hints, out),
@@ -220,7 +230,7 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "WSAConnect", wsa_connect as usize, spare()),
             ("ws2_32.dll", "sendto", sendto as usize, &O_SENDTO),
             ("ws2_32.dll", "WSAIoctl", wsai_ioctl as usize, &O_WSAIOCTL),
-            ("ws2_32.dll", "WSASendTo", wsa_send_to as usize, spare()),
+            ("ws2_32.dll", "WSASendTo", wsa_send_to as usize, &O_WSA_SEND_TO),
             ("ws2_32.dll", "WSASendMsg", wsa_send_msg as usize, &O_WSA_SEND_MSG),
             ("ws2_32.dll", "gethostbyname", gethostbyname as usize, spare()),
             ("ws2_32.dll", "getaddrinfo", getaddrinfo as usize, &O_GETADDRINFO),
@@ -354,7 +364,10 @@ unsafe extern "system" fn wsa_connect(s: usize, name: *const u8, len: i32, _a: *
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn wsa_send_to(_s: usize, _bufs: *const c_void, _n: u32, _sent: *mut u32, _flags: u32, _to: *const u8, _tolen: i32, _ov: *mut c_void, _cb: *const c_void) -> i32 {
+unsafe extern "system" fn wsa_send_to(s: usize, bufs: *const c_void, n: u32, sent: *mut u32, flags: u32, to: *const u8, tolen: i32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    if to.is_null() || loopback(to, tolen) {
+        return orig_wsa_send_to(s, bufs, n, sent, flags, to, tolen, ov, cb);
+    }
     unreachable_net("WSASendTo")
 }
 
@@ -642,6 +655,32 @@ mod tests {
             assert_eq!(send(&to), WSAENETUNREACH);
             to[4..8].copy_from_slice(&[127, 0, 0, 1]);
             assert_ne!(send(&to), WSAENETUNREACH);
+        }
+    }
+
+    #[test]
+    fn wsa_send_to_lets_loopback_through() {
+        #[link(name = "ws2_32", kind = "raw-dylib")]
+        extern "system" {
+            fn WSAGetLastError() -> i32;
+        }
+        let v4 = |a: [u8; 4]| [2, 0, 0, 80, a[0], a[1], a[2], a[3], 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut sent = 0u32;
+        unsafe {
+            // Non-loopback destination is blocked with WSAENETUNREACH (10051).
+            WSASetLastError(0);
+            assert_eq!(wsa_send_to(usize::MAX, std::ptr::null(), 0, &mut sent, 0, v4([8, 8, 8, 8]).as_ptr(), 16, std::ptr::null_mut(), std::ptr::null()), -1);
+            assert_eq!(WSAGetLastError(), WSAENETUNREACH);
+
+            // Loopback destination reaches the original WSASendTo (fails with WSAENOTSOCK/WSANOTINITIALISED, not WSAENETUNREACH).
+            WSASetLastError(0);
+            let _ = wsa_send_to(usize::MAX, std::ptr::null(), 0, &mut sent, 0, v4([127, 0, 0, 1]).as_ptr(), 16, std::ptr::null_mut(), std::ptr::null());
+            assert_ne!(WSAGetLastError(), WSAENETUNREACH);
+
+            // Null destination (connected socket) also reaches the original WSASendTo, matching sendto.
+            WSASetLastError(0);
+            let _ = wsa_send_to(usize::MAX, std::ptr::null(), 0, &mut sent, 0, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null());
+            assert_ne!(WSAGetLastError(), WSAENETUNREACH);
         }
     }
 }
