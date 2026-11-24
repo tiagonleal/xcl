@@ -90,7 +90,8 @@ fn note(what: &str) {
     }
 }
 
-/// 127.0.0.0/8 or ::1 (sockaddr_in / sockaddr_in6)
+/// 127.0.0.0/8 or ::1 (sockaddr_in / sockaddr_in6), or 127.0.0.0/8 as an IPv4-mapped address
+/// (::ffff:127.x.x.x – how a socket for both IPv6 and IPv4 names an IPv4 host)
 unsafe fn loopback(name: *const u8, len: i32) -> bool {
     if name.is_null() || len < 8 {
         return false;
@@ -99,7 +100,7 @@ unsafe fn loopback(name: *const u8, len: i32) -> bool {
         2 => *name.add(4) == 127,
         23 if len >= 24 => {
             let a = std::slice::from_raw_parts(name.add(8), 16);
-            a[..15].iter().all(|&b| b == 0) && a[15] == 1
+            (a[..15].iter().all(|&b| b == 0) && a[15] == 1) || (a[..10].iter().all(|&b| b == 0) && a[10..12] == [0xff, 0xff] && a[12] == 127)
         }
         _ => false,
     }
@@ -362,6 +363,14 @@ mod tests {
             assert!(loopback(v6.as_ptr(), 28));
             v6[8] = 0x20;
             assert!(!loopback(v6.as_ptr(), 28));
+            let mapped = |a: [u8; 4]| {
+                let mut m = [0u8; 28];
+                m[0] = 23;
+                m[18..24].copy_from_slice(&[0xff, 0xff, a[0], a[1], a[2], a[3]]);
+                m
+            };
+            assert!(loopback(mapped([127, 0, 0, 1]).as_ptr(), 28));
+            assert!(!loopback(mapped([8, 8, 8, 8]).as_ptr(), 28));
             assert_eq!(connect(usize::MAX, v4([8, 8, 8, 8]).as_ptr(), 16), -1);
             assert_eq!(send_request(std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 0), 0);
         }
