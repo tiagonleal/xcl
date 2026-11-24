@@ -48,6 +48,8 @@ extern "system" {
     ) -> i32;
     #[link_name = "sendto"]
     fn real_sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
+    #[link_name = "WSASendMsg"]
+    fn real_wsa_send_msg(s: usize, msg: *const c_void, flags: u32, sent: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32;
     fn WSASetLastError(e: i32);
     #[link_name = "getaddrinfo"]
     fn real_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32;
@@ -133,6 +135,7 @@ unsafe fn unreachable_net(what: &str) -> i32 {
 /// linked import is the original)
 static O_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
+static O_WSA_SEND_MSG: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
@@ -174,6 +177,13 @@ unsafe fn orig_wsai_ioctl(
     >(f)(s, code, in_buf, in_len, out_buf, out_len, returned, overlapped, completion)
 }
 
+unsafe fn orig_wsa_send_msg(s: usize, msg: *const c_void, flags: u32, sent: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    match O_WSA_SEND_MSG.load(Ordering::Acquire) {
+        0 => real_wsa_send_msg(s, msg, flags, sent, ov, cb),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32>(f)(s, msg, flags, sent, ov, cb),
+    }
+}
+
 unsafe fn orig_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32 {
     match O_GETADDRINFO.load(Ordering::Acquire) {
         0 => real_getaddrinfo(node, service, hints, out),
@@ -195,7 +205,7 @@ pub fn install_system_hooks() {
     ONCE.call_once(|| unsafe {
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 19] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 20] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
             ("winhttp.dll", "WinHttpConnect", null_handle_winhttp as usize, spare()),
             ("wininet.dll", "InternetConnectA", null_handle_inet8 as usize, spare()),
@@ -211,6 +221,7 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "sendto", sendto as usize, &O_SENDTO),
             ("ws2_32.dll", "WSAIoctl", wsai_ioctl as usize, &O_WSAIOCTL),
             ("ws2_32.dll", "WSASendTo", wsa_send_to as usize, spare()),
+            ("ws2_32.dll", "WSASendMsg", wsa_send_msg as usize, &O_WSA_SEND_MSG),
             ("ws2_32.dll", "gethostbyname", gethostbyname as usize, spare()),
             ("ws2_32.dll", "getaddrinfo", getaddrinfo as usize, &O_GETADDRINFO),
             ("ws2_32.dll", "GetAddrInfoW", getaddrinfo_w as usize, &O_GETADDRINFO_W),
@@ -345,6 +356,17 @@ unsafe extern "system" fn wsa_connect(s: usize, name: *const u8, len: i32, _a: *
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn wsa_send_to(_s: usize, _bufs: *const c_void, _n: u32, _sent: *mut u32, _flags: u32, _to: *const u8, _tolen: i32, _ov: *mut c_void, _cb: *const c_void) -> i32 {
     unreachable_net("WSASendTo")
+}
+
+/// WSASendMsg has its destination in the message (WSAMSG begins with the address and its
+/// length), so a datagram sent with it needs neither `sendto` nor `connect`. As in `sendto`:
+/// no address (a connected socket) or loopback goes to the original.
+unsafe extern "system" fn wsa_send_msg(s: usize, msg: *const c_void, flags: u32, sent: *mut u32, ov: *mut c_void, cb: *const c_void) -> i32 {
+    let (to, tolen) = if msg.is_null() { (std::ptr::null(), 0) } else { ((msg as *const *const u8).read_unaligned(), (msg as *const i32).byte_add(8).read_unaligned()) };
+    if to.is_null() || loopback(to, tolen) {
+        return orig_wsa_send_msg(s, msg, flags, sent, ov, cb);
+    }
+    unreachable_net("WSASendMsg")
 }
 
 unsafe extern "system" fn gethostbyname(_name: *const u8) -> *mut c_void {
@@ -589,5 +611,37 @@ mod tests {
         assert!(local_name("127.255.255.254"));
         assert!(local_name("::1"));
         assert!(local_name("0:0:0:0:0:0:0:1"));
+    }
+
+    /// WSASendMsg, found as the functions above are: a datagram to another host is refused.
+    /// No socket is needed to see who answers – the hook refuses before it looks at the socket
+    /// (10051), the system's own function says something else (10038 not a socket, or 10093
+    /// without WSAStartup), which is also what loopback gets, sent on to it.
+    #[test]
+    fn the_systems_wsasendmsg_refuses() {
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        #[link(name = "ws2_32", kind = "raw-dylib")]
+        extern "system" {
+            fn WSAGetLastError() -> i32;
+        }
+        install_system_hooks();
+        unsafe {
+            let f = GetProcAddress(LoadLibraryW(crate::util::wide("ws2_32.dll").as_ptr()), b"WSASendMsg\0".as_ptr()).expect("export") as usize;
+            let send_msg: unsafe extern "system" fn(usize, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32 = std::mem::transmute(f);
+            let mut to = [2u8, 0, 0, 53, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+            let mut byte = [0u8];
+            // WSABUF { len, buf }, WSAMSG { name, namelen, lpBuffers, dwBufferCount, Control, dwFlags }
+            let buf = [1usize, byte.as_mut_ptr() as usize];
+            let mut sent = 0u32;
+            let mut send = |to: &[u8; 16]| {
+                let msg = [to.as_ptr() as usize, 16, buf.as_ptr() as usize, 1, 0, 0, 0];
+                WSASetLastError(0);
+                assert_eq!(send_msg(usize::MAX, msg.as_ptr() as *const c_void, 0, &mut sent, std::ptr::null_mut(), std::ptr::null()), -1);
+                WSAGetLastError()
+            };
+            assert_eq!(send(&to), WSAENETUNREACH);
+            to[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            assert_ne!(send(&to), WSAENETUNREACH);
+        }
     }
 }
