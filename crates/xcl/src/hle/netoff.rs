@@ -32,6 +32,8 @@ const WSAID_CONNECTEX: [u8; 16] = [
 
 #[link(name = "ws2_32", kind = "raw-dylib")]
 extern "system" {
+    #[link_name = "bind"]
+    fn real_bind(s: usize, name: *const u8, len: i32) -> i32;
     #[link_name = "connect"]
     fn real_connect(s: usize, name: *const u8, len: i32) -> i32;
     #[link_name = "WSAIoctl"]
@@ -84,6 +86,7 @@ pub fn enabled() -> bool {
 fn table() -> Vec<(&'static str, usize, u16)> {
     vec![
         ("WinHttpSendRequest", send_request as *const () as usize, 0),
+        ("bind", bind as *const () as usize, 2),
         ("connect", connect as *const () as usize, 4),
         ("sendto", sendto as *const () as usize, 20),
         ("gethostbyname", gethostbyname as *const () as usize, 52),
@@ -111,6 +114,13 @@ fn note(what: &str) {
     }
 }
 
+fn note_bind(to: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        crate::xlog_info!("XCL_NETWORK=0: a bind to a network address is bound to {to} instead (no network)");
+    }
+}
+
 /// 127.0.0.0/8 or ::1 (sockaddr_in / sockaddr_in6), or 127.0.0.0/8 as an IPv4-mapped address
 /// (::ffff:127.x.x.x – how a socket for both IPv6 and IPv4 names an IPv4 host)
 unsafe fn loopback(name: *const u8, len: i32) -> bool {
@@ -135,6 +145,7 @@ unsafe fn unreachable_net(what: &str) -> i32 {
 
 /// the originals of the system functions hooked (`install_system_hooks`; 0: not hooked – the
 /// linked import is the original)
+static O_BIND: AtomicUsize = AtomicUsize::new(0);
 static O_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_WSA_SEND_MSG: AtomicUsize = AtomicUsize::new(0);
@@ -145,6 +156,13 @@ static O_WSAIOCTL: AtomicUsize = AtomicUsize::new(0);
 static O_CONNECT_EX: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+
+unsafe fn orig_bind(s: usize, name: *const u8, len: i32) -> i32 {
+    match O_BIND.load(Ordering::Acquire) {
+        0 => real_bind(s, name, len),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const u8, i32) -> i32>(f)(s, name, len),
+    }
+}
 
 unsafe fn orig_connect(s: usize, name: *const u8, len: i32) -> i32 {
     match O_CONNECT.load(Ordering::Acquire) {
@@ -215,7 +233,7 @@ pub fn install_system_hooks() {
     ONCE.call_once(|| unsafe {
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 20] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 21] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
             ("winhttp.dll", "WinHttpConnect", null_handle_winhttp as usize, spare()),
             ("wininet.dll", "InternetConnectA", null_handle_inet8 as usize, spare()),
@@ -226,6 +244,7 @@ pub fn install_system_hooks() {
             ("wininet.dll", "HttpSendRequestW", false_inet5 as usize, spare()),
             ("wininet.dll", "HttpSendRequestExA", false_inet5 as usize, spare()),
             ("wininet.dll", "HttpSendRequestExW", false_inet5 as usize, spare()),
+            ("ws2_32.dll", "bind", bind as usize, &O_BIND),
             ("ws2_32.dll", "connect", connect as usize, &O_CONNECT),
             ("ws2_32.dll", "WSAConnect", wsa_connect as usize, spare()),
             ("ws2_32.dll", "sendto", sendto as usize, &O_SENDTO),
@@ -286,6 +305,38 @@ unsafe extern "system" fn send_request(_req: *mut c_void, _headers: *const u16, 
     note("WinHttpSendRequest");
     SetLastError(ERROR_WINHTTP_NAME_NOT_RESOLVED);
     0
+}
+
+/// A socket bound to every interface (or to one of this machine's addresses) is bound to
+/// loopback instead, on the same port: the bind succeeds as on a console without a network, the
+/// title's own loopback traffic still reaches it, nothing from the network does – and Windows does
+/// not ask to let the network in (a retail game binds UDP 3074 on 0.0.0.0 at start).
+unsafe extern "system" fn bind(s: usize, name: *const u8, len: i32) -> i32 {
+    if loopback(name, len) {
+        return orig_bind(s, name, len);
+    }
+    match if name.is_null() || len < 2 { 0 } else { (name as *const u16).read_unaligned() } {
+        // sockaddr_in: family, port, address
+        2 if len >= 16 => {
+            let mut a = [0u8; 16];
+            std::ptr::copy_nonoverlapping(name, a.as_mut_ptr(), 16);
+            a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            note_bind("127.0.0.1");
+            orig_bind(s, a.as_ptr(), 16)
+        }
+        // sockaddr_in6: family, port, flow info, address, scope id (absent from the 24-byte form)
+        23 if len >= 24 => {
+            let n = len.min(28) as usize;
+            let mut a = [0u8; 28];
+            std::ptr::copy_nonoverlapping(name, a.as_mut_ptr(), n);
+            a[8..24].fill(0);
+            a[23] = 1;
+            a[24..28].fill(0);
+            note_bind("::1");
+            orig_bind(s, a.as_ptr(), n as i32)
+        }
+        _ => orig_bind(s, name, len),
+    }
 }
 
 unsafe extern "system" fn connect(s: usize, name: *const u8, len: i32) -> i32 {
@@ -681,6 +732,30 @@ mod tests {
             WSASetLastError(0);
             let _ = wsa_send_to(usize::MAX, std::ptr::null(), 0, &mut sent, 0, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null());
             assert_ne!(WSAGetLastError(), WSAENETUNREACH);
+        }
+    }
+
+    /// A socket bound to every interface ends up on loopback, on the port asked for, and
+    /// loopback traffic still reaches it; a loopback bind is left as it is.
+    #[test]
+    fn a_bind_to_every_interface_stays_on_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
+        install_system_hooks();
+        let udp = UdpSocket::bind("0.0.0.0:0").expect("bind");
+        let at = udp.local_addr().unwrap();
+        assert_eq!(at.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let other = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        assert_eq!(other.local_addr().unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        other.send_to(b"xcl", at).expect("send over loopback");
+        let mut buf = [0u8; 8];
+        assert_eq!(udp.recv_from(&mut buf).unwrap().0, 3);
+        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind");
+        let at = tcp.local_addr().unwrap();
+        assert_eq!(at.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        TcpStream::connect(at).expect("connect over loopback");
+        // IPv6 when the machine has it
+        if let Ok(v6) = UdpSocket::bind("[::]:0") {
+            assert_eq!(v6.local_addr().unwrap().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
         }
     }
 }
