@@ -484,10 +484,10 @@ fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
     println!();
     println!("Game exited with code {code:#x} ({code})");
     // repeated here: what the game printed in between has scrolled them away
-    let missing: Vec<_> = environment.iter().filter(|c| matches!(c.level, crate::preflight::Level::Warning | crate::preflight::Level::Error)).cloned().collect();
-    if !missing.is_empty() {
-        println!("Missing on this PC (see the start of the run):");
-        crate::preflight::print(&missing);
+    let warnings: Vec<_> = environment.iter().filter(|c| matches!(c.level, crate::preflight::Level::Warning | crate::preflight::Level::Error)).cloned().collect();
+    if !warnings.is_empty() {
+        println!("Preflight warnings (see the start of the run):");
+        crate::preflight::print(&warnings);
     }
     let Some(r) = report else {
         println!("No report – see the log: {}", boot.logs_dir().join("xcl.log").display());
