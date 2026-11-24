@@ -589,16 +589,24 @@ fn host_connectivity_hint() -> Option<NlNetworkConnectivityHint> {
     if unsafe { f(&mut hint) } == 0 { Some(hint) } else { None }
 }
 
+/// The hint's level from the host's (`None`: not known). With `XCL_NETWORK=0` it is None (1), as
+/// on a console without a network: answered with the host's InternetAccess, a retail game took
+/// itself to be online and kept asking its online service for a ticket that never came.
+fn connectivity_level(host: Option<u32>, network_off: bool) -> u32 {
+    match host {
+        _ if network_off => 1,
+        Some(l @ 1..=4) => l,
+        Some(5) => 2, // LocalAccess
+        _ => 3,       // InternetAccess
+    }
+}
+
 pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworkingConnectivityHint) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
     let host = host_connectivity_hint();
-    let level = match host.map(|h| h.connectivity_level) {
-        Some(l @ 1..=4) => l,
-        Some(5) => 2, // LocalAccess
-        _ => 3,       // InternetAccess
-    };
+    let level = connectivity_level(host.map(|h| h.connectivity_level), crate::hle::netoff::enabled());
     let cost = match host.map(|h| h.connectivity_cost) {
         Some(c @ 1..=3) => c,
         _ => 1, // Unrestricted
@@ -757,6 +765,17 @@ mod tests {
             assert_eq!((*ptr2).thumbprint_count, 0);
             assert!((*ptr2).thumbprints.is_null());
         }
+    }
+
+    /// `XCL_NETWORK=0`: no network whatever the host has; otherwise the host's level.
+    #[test]
+    fn connectivity_level_without_network_is_none() {
+        for host in [None, Some(1), Some(2), Some(3), Some(4), Some(5)] {
+            assert_eq!(connectivity_level(host, true), 1, "host {host:?}, network off");
+        }
+        assert_eq!(connectivity_level(Some(3), false), 3);
+        assert_eq!(connectivity_level(Some(5), false), 2);
+        assert_eq!(connectivity_level(None, false), 3);
     }
 
     #[test]
