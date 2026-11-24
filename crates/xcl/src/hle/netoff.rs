@@ -71,6 +71,7 @@ fn table() -> Vec<(&'static str, usize, u16)> {
         ("getaddrinfo", getaddrinfo as *const () as usize, 0),
         ("GetAddrInfoW", getaddrinfo_w as *const () as usize, 0),
         ("GetAddrInfoExW", getaddrinfo_ex as *const () as usize, 0),
+        ("WSAConnectByList", wsa_connect_by_list as *const () as usize, 0),
     ]
 }
 
@@ -180,6 +181,9 @@ pub fn install_system_hooks() {
                 failed.push(e);
             }
         }
+        if let Err(e) = crate::hooks::hook("ws2_32.dll", "WSAConnectByList", wsa_connect_by_list as usize, &O_WSA_CONNECT_BY_LIST) {
+            failed.push(e);
+        }
         if failed.is_empty() {
             crate::xlog_info!("XCL_NETWORK=0: the system's WinHTTP, WinINet and Winsock refuse the network for the whole process (loopback and local names excepted)");
         } else {
@@ -284,6 +288,64 @@ unsafe extern "system" fn getaddrinfo_ex(_n: *const u16, _s: *const u16, _ns: u3
     WSAHOST_NOT_FOUND
 }
 
+#[link(name = "ws2_32", kind = "raw-dylib")]
+extern "system" {
+    #[link_name = "WSAConnectByList"]
+    fn real_wsa_connect_by_list(s: usize, list: *const u8, local_len: *mut u32, local: *mut u8, remote_len: *mut u32, remote: *mut u8, timeout: *const c_void, reserved: *mut c_void) -> i32;
+}
+
+static O_WSA_CONNECT_BY_LIST: AtomicUsize = AtomicUsize::new(0);
+
+/// SOCKET_ADDRESS_LIST on x64: an INT count, then (at 8) SOCKET_ADDRESS entries of
+/// { LPSOCKADDR, INT } padded to 16 bytes
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SocketAddress {
+    addr: *const u8,
+    len: i32,
+}
+
+/// The loopback entries of a SOCKET_ADDRESS_LIST, and how many entries it has.
+unsafe fn loopback_entries(list: *const u8) -> (Vec<SocketAddress>, usize) {
+    if list.is_null() {
+        return (Vec::new(), 0);
+    }
+    let n = (list as *const i32).read_unaligned().max(0) as usize;
+    let first = list.add(8) as *const SocketAddress;
+    let keep = (0..n).map(|k| first.add(k).read_unaligned()).filter(|a| loopback(a.addr, a.len)).collect();
+    (keep, n)
+}
+
+/// WSAConnectByList connects to the first address of a list that answers, without calling the
+/// hooked connect – so it went to the network with XCL_NETWORK=0. Loopback entries still go
+/// through (in their order); a list with none fails as connect does.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn wsa_connect_by_list(s: usize, list: *const u8, local_len: *mut u32, local: *mut u8, remote_len: *mut u32, remote: *mut u8, timeout: *const c_void, reserved: *mut c_void) -> i32 {
+    let (keep, n) = loopback_entries(list);
+    if keep.is_empty() {
+        unreachable_net("WSAConnectByList");
+        return 0; // FALSE
+    }
+    // only loopback: the title's own list; otherwise a copy of the list with the loopback
+    // entries (count, then 16-byte entries from offset 8)
+    let mut own: Vec<u64> = Vec::new();
+    let list = if keep.len() == n {
+        list
+    } else {
+        own.push(keep.len() as u64);
+        for e in &keep {
+            own.extend_from_slice(&[e.addr as u64, e.len as u32 as u64]);
+        }
+        own.as_ptr() as *const u8
+    };
+    match O_WSA_CONNECT_BY_LIST.load(Ordering::Acquire) {
+        0 => real_wsa_connect_by_list(s, list, local_len, local, remote_len, remote, timeout, reserved),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const u8, *mut u32, *mut u8, *mut u32, *mut u8, *const c_void, *mut c_void) -> i32>(f)(
+            s, list, local_len, local, remote_len, remote, timeout, reserved,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +364,54 @@ mod tests {
             assert!(!loopback(v6.as_ptr(), 28));
             assert_eq!(connect(usize::MAX, v4([8, 8, 8, 8]).as_ptr(), 16), -1);
             assert_eq!(send_request(std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 0), 0);
+        }
+    }
+
+    /// WSAConnectByList skipped every hook and connected out (a live connect to 192.0.2.1:80
+    /// ran until WSAETIMEDOUT). Now a list without loopback fails with WSAENETUNREACH, through
+    /// the title's import and through the system's own export, and loopback entries still go on.
+    #[test]
+    fn wsa_connect_by_list_refuses_all_but_loopback() {
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        #[link(name = "ws2_32", kind = "raw-dylib")]
+        extern "system" {
+            fn WSAGetLastError() -> i32;
+        }
+        let v4 = |a: [u8; 4]| [2u8, 0, 0, 80, a[0], a[1], a[2], a[3], 0, 0, 0, 0, 0, 0, 0, 0];
+        let (lo, out) = (v4([127, 0, 0, 1]), v4([192, 0, 2, 1]));
+        let list = |addrs: &[&[u8; 16]]| -> Vec<u64> {
+            let mut l = vec![addrs.len() as u64];
+            for a in addrs {
+                l.extend_from_slice(&[a.as_ptr() as u64, 16]);
+            }
+            l
+        };
+        let (none, mixed, only) = (list(&[&out]), list(&[&out, &lo]), list(&[&lo]));
+        unsafe {
+            let (keep, n) = loopback_entries(mixed.as_ptr() as *const u8);
+            assert_eq!((keep.len(), n), (1, 2));
+            assert_eq!(keep[0].addr, lo.as_ptr());
+            assert_eq!(loopback_entries(std::ptr::null()).1, 0);
+
+            type ByList = unsafe extern "system" fn(usize, *const u8, *mut u32, *mut u8, *mut u32, *mut u8, *const c_void, *mut c_void) -> i32;
+            let call = |f: ByList, l: &[u64]| -> i32 {
+                WSASetLastError(0);
+                assert_eq!(f(usize::MAX, l.as_ptr() as *const u8, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut()), 0);
+                WSAGetLastError()
+            };
+            install_system_hooks();
+            let Some(raw) = GetProcAddress(LoadLibraryW(crate::util::wide("ws2_32.dll").as_ptr()), b"WSAConnectByList\0".as_ptr()) else {
+                // Wine/Proton ws2_32.dll does not export WSAConnectByList: still verify our detour refuses non-loopback.
+                assert_eq!(call(wsa_connect_by_list as ByList, &none), WSAENETUNREACH, "a list without loopback");
+                return;
+            };
+            let system: ByList = std::mem::transmute(raw);
+            for f in [wsa_connect_by_list as ByList, system] {
+                assert_eq!(call(f, &none), WSAENETUNREACH, "a list without loopback");
+                // loopback reaches the original, which fails on the invalid socket instead
+                assert_ne!(call(f, &mixed), WSAENETUNREACH, "the loopback entry of a mixed list");
+                assert_ne!(call(f, &only), WSAENETUNREACH, "a loopback list");
+            }
         }
     }
 
