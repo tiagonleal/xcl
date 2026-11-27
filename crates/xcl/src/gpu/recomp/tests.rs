@@ -5648,17 +5648,36 @@ fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
         }
         rays.push((node, o, d, inv));
     }
-    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let res = bvh::tests::with_watertight(true, || runner::run_code(&code, &st, &mem)).unwrap();
     let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
     // GPU and CPU may round 1 / d differently, so on the edge each is checked on its own
     let (mut gh, mut ch) = ([false; 2], [false; 2]);
     for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
         gh[l % 2] = f32::from_bits(res.vgpr[l][100]).is_finite();
-        ch[l % 2] = f32::from_bits(bvh::intersect_node(&data, node, 100.0, o, d, inv, true)[0]).is_finite();
+        ch[l % 2] = f32::from_bits(bvh::tests::with_watertight(true, || bvh::intersect_node(&data, node, 100.0, o, d, inv, true))[0]).is_finite();
         if l % 2 == 1 {
             assert!(gh[0] || gh[1], "lanes {} and {l}: GPU ray through the shared edge missed both", l - 1);
             assert!(ch[0] || ch[1], "lanes {} and {l}: CPU ray through the shared edge missed both", l - 1);
         }
+    }
+}
+
+/// `XCL_BVH_WATERTIGHT` selects the triangle test in the HLSL (a `#define`, so the text and
+/// DXC's cache key differ) and in the direct DXIL (other bytes); off is Möller–Trumbore.
+#[test]
+fn bvh_watertight_switch_changes_the_hlsl_and_the_dxil() {
+    use crate::gpu::bvh::tests::with_watertight;
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let hlsl = |on| with_watertight(on, || translate(&code, &Options::default()).unwrap().hlsl);
+    let (off, on) = (hlsl(false), hlsl(true));
+    assert!(off.contains("#define XCL_BVH_WATERTIGHT 0") && on.contains("#define XCL_BVH_WATERTIGHT 1"));
+    assert!(off.contains("#if XCL_BVH_WATERTIGHT") && off.contains("p = cross(d, e2)"));
+    assert_ne!(off, on);
+    let dxil = |on| with_watertight(on, || runner::direct_kernel(&code, true));
+    match (dxil(false), dxil(true)) {
+        (Ok(off), Ok(on)) => assert_ne!(off, on, "direct DXIL is the same with and without the switch"),
+        (a, b) => panic!("direct DXIL: {:?} / {:?}", a.err(), b.err()),
     }
 }
 

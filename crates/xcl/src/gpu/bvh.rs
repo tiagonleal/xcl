@@ -237,16 +237,32 @@ fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-#[cfg(test)]
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
-#[cfg(test)]
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// The triangle node's test as it returns it: (t·det, det, i·det, j·det), `None` = miss.
+pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+    if watertight() { triangle_hit_watertight(v, o, d) } else { triangle_hit_mt(v, o, d) }
+}
+
+/// `XCL_BVH_WATERTIGHT=1` (off by default): the triangle node uses the watertight test in the CPU
+/// reference, the HLSL prelude and the DXIL lowering; otherwise Möller–Trumbore as before. Read
+/// once; a test sets it for its own thread only (`tests::with_watertight`). The HLSL has it as a
+/// `#define` (so in DXC's cache key) and the translated cache's identity has it (`recomp::pso`).
+pub fn watertight() -> bool {
+    #[cfg(test)]
+    if let Some(w) = tests::WATERTIGHT.with(|c| c.get()) {
+        return w;
+    }
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("XCL_BVH_WATERTIGHT").is_ok_and(|v| v == "1"))
+}
+
+/// The watertight test of `triangle_hit`:
 /// Watertight (Woop, Benthin, Wald, "Watertight Ray/Triangle Intersection", JCGT 2013): the
 /// vertices are sheared so the ray runs along its largest axis and the signs of the three edge
 /// functions decide, so a ray through an edge two triangles share hits at least one of them
@@ -257,12 +273,12 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// (`dxil/lower_image.rs`) do the same operations in the same order.
 ///
 /// Adapted from victory-fork (https://github.com/fxceless/victory-fork, GPL-3.0-or-later),
-/// `crates/victory-shader/src/bvh.rs` `triangle`, which follows Mesa RADV
+/// commit `9a9091d`, `crates/victory-shader/src/bvh.rs` `triangle` (by fxceless), which follows Mesa RADV
 /// (https://gitlab.freedesktop.org/mesa/mesa, MIT, © 2021 Google):
-/// `src/amd/vulkan/nir/radv_nir_rt_common.c` `intersect_ray_amd_software_tri`. Changed 2026-11:
+/// `src/amd/vulkan/nir/radv_nir_rt_common.c` `intersect_ray_amd_software_tri`. Changed 2026-11-27:
 /// f32 edge functions (Mesa computes them in f64), no t sign test, XCL's result scale (Mesa
 /// returns t / |det| and the sign of det).
-pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+fn triangle_hit_watertight(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
     let kz = dominant_axis(d);
     let (kx, ky) = if d[kz] < 0.0 { ((kz + 2) % 3, (kz + 1) % 3) } else { ((kz + 1) % 3, (kz + 2) % 3) };
     let sz = 1.0 / d[kz];
@@ -292,8 +308,7 @@ fn dominant_axis(d: [f32; 3]) -> usize {
     if a[0] >= a[1] { if a[0] >= a[2] { 0 } else { 2 } } else if a[1] >= a[2] { 1 } else { 2 }
 }
 
-/// The Möller–Trumbore test XCL used before the watertight one (tests compare against it).
-#[cfg(test)]
+/// The Möller–Trumbore test XCL used before the watertight one (`XCL_BVH_WATERTIGHT` unset).
 fn triangle_hit_mt(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
     let (e1, e2) = (sub(v[1], v[0]), sub(v[2], v[0]));
     let p = cross(d, e2);
@@ -734,7 +749,7 @@ pub(crate) mod tests {
 
     /// hits among `tris` for a ray from `o` along `d`
     fn hits(tris: &[Triangle], o: [f32; 3], d: [f32; 3]) -> usize {
-        tris.iter().filter(|t| triangle_hit(t, o, d).is_some()).count()
+        tris.iter().filter(|t| triangle_hit_watertight(t, o, d).is_some()).count()
     }
 
     /// Random rays from a point on the edge two triangles share and on the vertex a fan shares
@@ -799,7 +814,7 @@ pub(crate) mod tests {
                 let to = [r(-8.0, 8.0), r(-8.0, 8.0), r(-8.0, 8.0)];
                 let d = sub(to, o);
                 for t in &tris {
-                    let (w, m) = (triangle_hit(t, o, d), triangle_hit_mt(t, o, d));
+                    let (w, m) = (triangle_hit_watertight(t, o, d), triangle_hit_mt(t, o, d));
                     let Some(m) = m else {
                         if let Some(w) = w {
                             // only a ray within rounding of an edge may differ
@@ -870,6 +885,10 @@ pub(crate) mod tests {
         let (o, d) = ([5.911541f32, -0.8080063, 0.59203976], [-1.0f32, -0.13060194, 0.000772506]);
         assert_eq!(pair.iter().filter(|t| triangle_hit_mt(t, o, d).is_some()).count(), 0);
         assert!(hits(&pair, o, d) >= 1);
+        // the switch: off (the default) = Möller–Trumbore, misses both; on = watertight
+        let n = |on| with_watertight(on, || pair.iter().filter(|t| triangle_hit(t, o, d).is_some()).count());
+        assert_eq!(n(false), 0);
+        assert!(n(true) >= 1);
     }
 
     /// Equal largest components pick the first axis (x before y before z), as in the HLSL and
@@ -889,7 +908,7 @@ pub(crate) mod tests {
     fn triangle_hit_non_finite_t_misses() {
         let tri = [[5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [5.0, 0.0, 1.0]];
         let (o, d) = ([0.0, 0.2, 0.2], [1e-38f32, 0.0, 0.0]);
-        assert!(triangle_hit(&tri, o, d).is_none());
+        assert!(triangle_hit_watertight(&tri, o, d).is_none());
         let mut data = vec![0u8; 64];
         for (k, p) in tri.iter().enumerate() {
             for x in 0..3 {
@@ -897,7 +916,7 @@ pub(crate) mod tests {
             }
         }
         data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
-        let r = intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false).map(f32::from_bits);
+        let r = with_watertight(true, || intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false)).map(f32::from_bits);
         assert_eq!(r, [f32::INFINITY, 1.0, 0.0, 0.0]);
     }
 
@@ -913,18 +932,18 @@ pub(crate) mod tests {
             [[0.2, 0.2, 0.0], [0.2, 0.2, 0.0], [1.0, 0.0, 0.0]],
         ];
         for t in &degenerate {
-            assert!(triangle_hit(t, o, d).is_none(), "{t:?}");
+            assert!(triangle_hit_watertight(t, o, d).is_none(), "{t:?}");
         }
         // in the plane, along each in-plane axis and a diagonal
         for d in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 0.0, 0.0]] {
-            assert!(triangle_hit(&tri, [-1.0, 0.2, 0.0], d).is_none(), "{d:?}");
+            assert!(triangle_hit_watertight(&tri, [-1.0, 0.2, 0.0], d).is_none(), "{d:?}");
         }
-        assert!(triangle_hit(&tri, o, [0.0; 3]).is_none());
-        assert!(triangle_hit(&tri, o, [f32::NAN, 0.0, 1.0]).is_none());
-        assert!(triangle_hit(&tri, [f32::NAN, 0.2, -1.0], d).is_none());
+        assert!(triangle_hit_watertight(&tri, o, [0.0; 3]).is_none());
+        assert!(triangle_hit_watertight(&tri, o, [f32::NAN, 0.0, 1.0]).is_none());
+        assert!(triangle_hit_watertight(&tri, [f32::NAN, 0.2, -1.0], d).is_none());
         let mut nan = tri;
         nan[1][0] = f32::NAN;
-        assert!(triangle_hit(&nan, o, d).is_none());
+        assert!(triangle_hit_watertight(&nan, o, d).is_none());
         // the node returns its miss encoding, never a NaN
         for t in degenerate.iter().chain([&nan]) {
             let mut data = vec![0u8; 64];
@@ -934,8 +953,21 @@ pub(crate) mod tests {
                 }
             }
             data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
-            let r = intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false).map(f32::from_bits);
+            let r = with_watertight(true, || intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false)).map(f32::from_bits);
             assert_eq!(r, [f32::INFINITY, 1.0, 0.0, 0.0]);
         }
+    }
+
+    thread_local! {
+        /// `watertight()` for this test thread only (`None`: `XCL_BVH_WATERTIGHT`)
+        pub(crate) static WATERTIGHT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// `f` with the triangle test switched `on` / off on this thread, restored after
+    pub(crate) fn with_watertight<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        let old = WATERTIGHT.with(|c| c.replace(Some(on)));
+        let r = f();
+        WATERTIGHT.with(|c| c.set(old));
+        r
     }
 }

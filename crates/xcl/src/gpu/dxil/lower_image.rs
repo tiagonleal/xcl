@@ -60,6 +60,23 @@ impl Lw {
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
+    fn cross(&mut self, a: [Value; 3], b: [Value; 3]) -> [Value; 3] {
+        let x0 = self.fmul(a[1], b[2]);
+        let x1 = self.fmul(a[2], b[1]);
+        let x = self.fsub(x0, x1);
+        let y0 = self.fmul(a[2], b[0]);
+        let y1 = self.fmul(a[0], b[2]);
+        let y = self.fsub(y0, y1);
+        let z0 = self.fmul(a[0], b[1]);
+        let z1 = self.fmul(a[1], b[0]);
+        let z = self.fsub(z0, z1);
+        [x, y, z]
+    }
+    /// HLSL `dot(float3, float3)` = `Dot3`.
+    fn dot3(&mut self, a: [Value; 3], b: [Value; 3]) -> Value {
+        let f32 = self.s.m.f32();
+        self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
+    }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
@@ -195,6 +212,9 @@ impl Lw {
             let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
             let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
             let tw = words[9];
+            let z = lw.fc(0.0);
+            // `XCL_BVH_WATERTIGHT` (`gpu::bvh::watertight`); the direct translator's cache identity has it
+            let (t, det, i, j, hit) = if crate::gpu::bvh::watertight() {
             // watertight test as gpu::bvh::triangle_hit and the HLSL prelude (Woop, Benthin, Wald
             // 2013; adapted from victory-fork, https://github.com/fxceless/victory-fork,
             // GPL-3.0-or-later, after Mesa RADV, MIT); no fused products, so a shared edge's
@@ -220,7 +240,6 @@ impl Lw {
                 [x, y, z]
             };
             let pd = perm(lw, dir);
-            let z = lw.fc(0.0);
             let sw = lw.fcmp(Pred::FOLt, pd[2], z);
             let swap = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] { [lw.sel(sw, v[1], v[0]), lw.sel(sw, v[0], v[1]), v[2]] };
             let pd = swap(lw, pd);
@@ -279,6 +298,34 @@ impl Lw {
                 let fin = lw.fcmp(Pred::FOLt, ax, pinf);
                 hit = lw.land(hit, fin);
             }
+            (t, det, i, j, hit)
+            } else {
+            // Möller–Trumbore, the test before XCL_BVH_WATERTIGHT
+            let e1 = lw.f3(v1, v0, Lw::fsub);
+            let e2 = lw.f3(v2, v0, Lw::fsub);
+            let p = lw.cross(dir, e2);
+            let det = lw.dot3(e1, p);
+            let sv = lw.f3(o, v0, Lw::fsub);
+            let q = lw.cross(sv, e1);
+            let i = lw.dot3(sv, p);
+            let j = lw.dot3(dir, q);
+            let t = lw.dot3(e2, q);
+            let ij = lw.fadd(i, j);
+            let dpos = lw.fcmp(Pred::FOGt, det, z);
+            let c1 = lw.fcmp(Pred::FOGe, i, z);
+            let c2 = lw.fcmp(Pred::FOGe, j, z);
+            let c3 = lw.fcmp(Pred::FOLe, ij, det);
+            let hp = lw.land(c1, c2);
+            let hp = lw.land(hp, c3);
+            let dneg = lw.fcmp(Pred::FOLt, det, z);
+            let n1 = lw.fcmp(Pred::FOLe, i, z);
+            let n2 = lw.fcmp(Pred::FOLe, j, z);
+            let n3 = lw.fcmp(Pred::FOGe, ij, det);
+            let hn = lw.land(dneg, n1);
+            let hn = lw.land(hn, n2);
+            let hn = lw.land(hn, n3);
+            (t, det, i, j, lw.sel(dpos, hp, hn))
+            };
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];

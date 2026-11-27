@@ -4996,6 +4996,8 @@ impl Em {
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
+        // the BVH triangle test (`gpu::bvh::watertight`): part of the text, so of the DXC cache key
+        let _ = writeln!(h, "#define XCL_BVH_WATERTIGHT {}", crate::gpu::bvh::watertight() as u8);
         h.push_str(PRELUDE_MEM);
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
@@ -6217,6 +6219,7 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
         uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
         float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
+#if XCL_BVH_WATERTIGHT
         // watertight test as gpu::bvh::triangle_hit (Woop, Benthin, Wald 2013; adapted from
         // victory-fork, https://github.com/fxceless/victory-fork, GPL-3.0-or-later, after Mesa
         // RADV, MIT): shear so the ray runs along its largest axis, signs of the edge functions
@@ -6250,6 +6253,15 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         t = t * s; precise float dets = det * s; i = i * s; j = j * s;
         bool hit = !mixed && (det > 0.0f || det < 0.0f) && !isinf(t) && !isnan(t) && !isinf(dets) && !isnan(dets);
         det = dets;
+#else
+        // Möller–Trumbore, the test before XCL_BVH_WATERTIGHT
+        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
+        float det = dot(e1, p);
+        float3 sv = o - v0, q = cross(sv, e1);
+        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+#endif
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
         uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);
