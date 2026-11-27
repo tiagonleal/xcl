@@ -198,7 +198,9 @@ impl Lw {
             // watertight test as gpu::bvh::triangle_hit and the HLSL prelude (Woop, Benthin, Wald
             // 2013; adapted from victory-fork, https://github.com/fxceless/victory-fork,
             // GPL-3.0-or-later, after Mesa RADV, MIT); no fused products, so a shared edge's
-            // function is exactly negated in the other triangle
+            // function is exactly negated in the other triangle. Limit: the module drops
+            // DisableMathRefactoring when it also uses FMad (shader.rs), and a driver may then
+            // fuse these products, which loses the exact negation (no worse than before)
             lw.s.require(super::shader::Feature::DisableMathRefactoring);
             let ad = [lw.fabs(dir[0]), lw.fabs(dir[1]), lw.fabs(dir[2])];
             let xy = lw.fcmp(Pred::FOGe, ad[0], ad[1]);
@@ -260,12 +262,23 @@ impl Lw {
             let tj = lw.fmul(j, p2[2]);
             let t = lw.fadd(tu, ti);
             let t = lw.fadd(t, tj);
-            // edge-on (det = 0) and NaN miss
+            // back to Möller–Trumbore's scale after the decision; edge-on (det = 0), NaN and a
+            // non-finite t or det miss
             let dpos = lw.fcmp(Pred::FOGt, det, z);
             let dneg = lw.fcmp(Pred::FOLt, det, z);
             let dnz = lw.lor(dpos, dneg);
             let inside = lw.lnot(mixed);
             let hit = lw.land(inside, dnz);
+            let s = lw.fabs(pd[2]);
+            let (t, det, i, j) = (lw.fmul(t, s), lw.fmul(det, s), lw.fmul(i, s), lw.fmul(j, s));
+            let pinf = lw.fc(f32::INFINITY);
+            let mut hit = hit;
+            for x in [t, det] {
+                // |x| < inf is false for inf and NaN
+                let ax = lw.fabs(x);
+                let fin = lw.fcmp(Pred::FOLt, ax, pinf);
+                hit = lw.land(hit, fin);
+            }
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];

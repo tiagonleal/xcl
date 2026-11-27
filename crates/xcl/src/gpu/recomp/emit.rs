@@ -6221,7 +6221,8 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         // victory-fork, https://github.com/fxceless/victory-fork, GPL-3.0-or-later, after Mesa
         // RADV, MIT): shear so the ray runs along its largest axis, signs of the edge functions
         // decide; `precise` so that no product is fused and a shared edge's function is exactly
-        // negated in the other triangle
+        // negated in the other triangle (DXC marks them so in the DXIL; a driver that fuses
+        // anyway loses that)
         float3 ad = abs(d);
         uint kz = ad.x >= ad.y ? (ad.x >= ad.z ? 0u : 2u) : (ad.y >= ad.z ? 1u : 2u);
         // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
@@ -6243,8 +6244,12 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         bool mixed = (u < 0.0f || i < 0.0f || j < 0.0f) && (u > 0.0f || i > 0.0f || j > 0.0f);
         precise float det = u + (i + j);
         precise float t = (u * p0.z + i * p1.z) + j * p2.z;
-        // edge-on (det = 0) and NaN miss
-        bool hit = !mixed && (det > 0.0f || det < 0.0f);
+        // back to Möller–Trumbore's scale after the decision; edge-on (det = 0), NaN and a
+        // non-finite t or det miss
+        precise float s = abs(pd.z);
+        t = t * s; precise float dets = det * s; i = i * s; j = j * s;
+        bool hit = !mixed && (det > 0.0f || det < 0.0f) && !isinf(t) && !isnan(t) && !isinf(dets) && !isnan(dets);
+        det = dets;
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
         uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);

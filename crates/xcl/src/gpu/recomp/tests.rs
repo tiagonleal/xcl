@@ -5596,8 +5596,8 @@ fn gpu_triangle_pair_and_box16_nodes() {
 
 /// Watertight triangle test on the GPU: rays exactly through the edge a triangle pair shares
 /// (type 0 = (v0, v1, v2) and type 1 = (v1, v3, v2) share v1–v2), along each axis and both
-/// signs. Each ray goes to both triangles in neighbouring lanes: at least one hits, and hit /
-/// miss is the CPU's.
+/// signs. Each ray goes to both triangles in neighbouring lanes: at least one hits on the GPU,
+/// and at least one in the CPU reference (each checked on its own).
 #[test]
 fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
     use crate::gpu::bvh;

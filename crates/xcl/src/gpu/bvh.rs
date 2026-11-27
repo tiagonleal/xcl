@@ -251,18 +251,19 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// vertices are sheared so the ray runs along its largest axis and the signs of the three edge
 /// functions decide, so a ray through an edge two triangles share hits at least one of them
 /// (both when the edge function is exactly 0; the console's rule for that tie is not known).
-/// Edge-on (det = 0) and NaN miss; t is not tested here (the traversal does). The HLSL prelude
-/// (`recomp/emit.rs` `bvh_intersect`) and the DXIL lowering (`dxil/lower_image.rs`) do the same
-/// operations in the same order.
+/// Edge-on (det = 0), NaN and a non-finite t or det miss; t's sign is not tested here (the
+/// traversal does). The four values have the Möller–Trumbore scale XCL returned before. The
+/// HLSL prelude (`recomp/emit.rs` `bvh_intersect`) and the DXIL lowering
+/// (`dxil/lower_image.rs`) do the same operations in the same order.
 ///
 /// Adapted from victory-fork (https://github.com/fxceless/victory-fork, GPL-3.0-or-later),
-/// `crates/victory-shader/src/bvh.rs` `triangle`, which follows the software emulation of this
-/// instruction in Mesa RADV (https://gitlab.freedesktop.org/mesa/mesa, MIT). Changed 2026-11:
-/// no t sign test, XCL's result encoding.
+/// `crates/victory-shader/src/bvh.rs` `triangle`, which follows Mesa RADV
+/// (https://gitlab.freedesktop.org/mesa/mesa, MIT, © 2021 Google):
+/// `src/amd/vulkan/nir/radv_nir_rt_common.c` `intersect_ray_amd_software_tri`. Changed 2026-11:
+/// f32 edge functions (Mesa computes them in f64), no t sign test, XCL's result scale (Mesa
+/// returns t / |det| and the sign of det).
 pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
-    let a = d.map(f32::abs);
-    // largest axis, then the other two in the order that keeps the winding
-    let kz = if a[0] >= a[1] { if a[0] >= a[2] { 0 } else { 2 } } else if a[1] >= a[2] { 1 } else { 2 };
+    let kz = dominant_axis(d);
     let (kx, ky) = if d[kz] < 0.0 { ((kz + 2) % 3, (kz + 1) % 3) } else { ((kz + 1) % 3, (kz + 2) % 3) };
     let sz = 1.0 / d[kz];
     let (sx, sy) = (d[kx] * sz, d[ky] * sz);
@@ -278,7 +279,17 @@ pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> 
     let mixed = (u < 0.0 || i < 0.0 || j < 0.0) && (u > 0.0 || i > 0.0 || j > 0.0);
     let det = u + (i + j);
     let t = (u * p0[2] + i * p1[2]) + j * p2[2];
-    (!mixed && (det > 0.0 || det < 0.0)).then_some([t, det, i, j])
+    // back to Möller–Trumbore's scale (the sheared determinant is its det / |d[kz]|), after
+    // the decision; a non-finite t or det (tiny d[kz], huge shear) misses
+    let s = d[kz].abs();
+    let r = [t * s, det * s, i * s, j * s];
+    (!mixed && (det > 0.0 || det < 0.0) && r[0].is_finite() && r[1].is_finite()).then_some(r)
+}
+
+/// The ray's largest axis (ties: x before y before z), along which `triangle_hit` shears.
+fn dominant_axis(d: [f32; 3]) -> usize {
+    let a = d.map(f32::abs);
+    if a[0] >= a[1] { if a[0] >= a[2] { 0 } else { 2 } } else if a[1] >= a[2] { 1 } else { 2 }
 }
 
 /// The Möller–Trumbore test XCL used before the watertight one (tests compare against it).
@@ -726,8 +737,8 @@ pub(crate) mod tests {
         tris.iter().filter(|t| triangle_hit(t, o, d).is_some()).count()
     }
 
-    /// Rays exactly through the edge two triangles share and through the vertex a fan shares:
-    /// at least one triangle hits, along every dominant axis, both ray signs and windings.
+    /// Random rays from a point on the edge two triangles share and on the vertex a fan shares
+    /// (rounded, so near, not exactly on it): at least one triangle hits, every axis and sign.
     #[test]
     fn triangle_hit_is_watertight_at_shared_edges_and_vertices() {
         let mut r = rng(11);
@@ -801,6 +812,7 @@ pub(crate) mod tests {
                         continue;
                     };
                     assert_eq!(w[1] > 0.0, m[1] > 0.0, "facing");
+                    assert!((w[1] - m[1]).abs() <= 1e-3 * m[1].abs(), "det scale: {w:?} vs {m:?}");
                     for k in [0, 2, 3] {
                         assert!((w[k] / w[1] - m[k] / m[1]).abs() < 1e-4, "{k}: {w:?} vs {m:?}");
                     }
@@ -809,6 +821,84 @@ pub(crate) mod tests {
             }
             assert!(both > 100, "seed {seed}: {both} hits");
         }
+    }
+
+    /// Dyadic coordinates, so the ray passes exactly through the shared edge / vertex: at least
+    /// one triangle hits, along every dominant axis, both signs, the shared edge listed in
+    /// opposite orders (consistent winding) and in the same order.
+    #[test]
+    fn triangle_hit_exact_shared_edge_and_vertex() {
+        let (a, b) = ([-1.0, -0.5, 1.0], [1.5, 1.0, 1.0]);
+        let (c, e) = ([-2.0, 3.0, 1.5], [2.0, -3.0, 0.5]);
+        let pairs: [[Triangle; 2]; 2] = [[[a, b, c], [b, a, e]], [[a, b, c], [a, b, e]]];
+        let v = [0.25, -0.5, 1.0];
+        let ring = [[2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [-2.0, 2.0], [-2.0, 0.0], [-2.0, -2.0], [0.0, -2.0], [2.0, -2.0]];
+        let fan: Vec<Triangle> = (0..8)
+            .map(|k| {
+                let p = |k: usize| [v[0] + ring[k % 8][0], v[1] + ring[k % 8][1], 1.0 + 0.25 * (k % 2) as f32];
+                [v, p(k), p(k + 1)]
+            })
+            .collect();
+        let dirs = [[0.0, 0.0, 1.0], [0.25, -0.5, 1.0], [-0.375, 0.125, 1.0], [0.5, 0.5, -1.0], [-0.75, 0.25, -1.0]];
+        for axis in 0..3 {
+            for flip in [false, true] {
+                for dl in dirs {
+                    let d = place(dl, axis, flip);
+                    for s in [0.25f32, 0.5, 0.75] {
+                        let on = [0, 1, 2].map(|k| a[k] + s * (b[k] - a[k]));
+                        let o = place([0, 1, 2].map(|k| on[k] - 2.0 * dl[k]), axis, flip);
+                        for pair in &pairs {
+                            let pair = pair.map(|t| t.map(|p| place(p, axis, flip)));
+                            assert!(hits(&pair, o, d) >= 1, "edge: axis {axis} flip {flip} s {s} d {d:?} {pair:?}");
+                        }
+                    }
+                    let o = place([0, 1, 2].map(|k| v[k] - 2.0 * dl[k]), axis, flip);
+                    let fan: Vec<Triangle> = fan.iter().map(|t| t.map(|p| place(p, axis, flip))).collect();
+                    assert!(hits(&fan, o, d) >= 1, "vertex: axis {axis} flip {flip} d {d:?}");
+                }
+            }
+        }
+    }
+
+    /// Found by `triangle_hit_is_watertight_at_shared_edges_and_vertices` (seed 11, first case):
+    /// a ray through the edge (1.911541, -2.025442, 0.78372467)–(1.911541, 2.740394, -0.50947857)
+    /// that Möller–Trumbore misses in both triangles; the watertight test hits at least one.
+    #[test]
+    fn triangle_hit_pinned_shared_edge_moller_trumbore_misses() {
+        let (a, b) = ([1.911541f32, -2.025442, 0.78372467], [1.911541f32, 2.740394, -0.50947857]);
+        let pair = [[a, b, [2.1104007, -1.6796683, 9.487581]], [b, a, [1.5455573, 0.7414906, -8.11272]]];
+        let (o, d) = ([5.911541f32, -0.8080063, 0.59203976], [-1.0f32, -0.13060194, 0.000772506]);
+        assert_eq!(pair.iter().filter(|t| triangle_hit_mt(t, o, d).is_some()).count(), 0);
+        assert!(hits(&pair, o, d) >= 1);
+    }
+
+    /// Equal largest components pick the first axis (x before y before z), as in the HLSL and
+    /// DXIL `kz` selection.
+    #[test]
+    fn triangle_hit_dominant_axis_ties() {
+        assert_eq!(dominant_axis([1.0, -1.0, 0.5]), 0);
+        assert_eq!(dominant_axis([-1.0, 1.0, 1.0]), 0);
+        assert_eq!(dominant_axis([0.5, 1.0, -1.0]), 1);
+        assert_eq!(dominant_axis([0.5, -0.25, 1.0]), 2);
+        assert_eq!(dominant_axis([0.0, 0.0, 0.0]), 0);
+    }
+
+    /// A tiny largest component with a far triangle overflows the sheared depth: the node
+    /// returns its miss encoding, not an infinite or NaN t with a finite det.
+    #[test]
+    fn triangle_hit_non_finite_t_misses() {
+        let tri = [[5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [5.0, 0.0, 1.0]];
+        let (o, d) = ([0.0, 0.2, 0.2], [1e-38f32, 0.0, 0.0]);
+        assert!(triangle_hit(&tri, o, d).is_none());
+        let mut data = vec![0u8; 64];
+        for (k, p) in tri.iter().enumerate() {
+            for x in 0..3 {
+                data[12 * k + 4 * x..12 * k + 4 * x + 4].copy_from_slice(&p[x].to_le_bytes());
+            }
+        }
+        data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
+        let r = intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false).map(f32::from_bits);
+        assert_eq!(r, [f32::INFINITY, 1.0, 0.0, 0.0]);
     }
 
     /// Degenerate triangles, rays in the triangle's plane, a zero direction and NaN miss.
