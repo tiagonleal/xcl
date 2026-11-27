@@ -4,6 +4,11 @@
 //! `image_bvh(64)_intersect_ray` on the flat memory (port of
 //! `recomp/emit.rs` `mimg` and `bvh_intersect`; compute rules: no implicit
 //! derivatives, so implicit-LOD samples take LOD 0 / the bias).
+//!
+//! The watertight BVH triangle test (`XCL_BVH_WATERTIGHT=1`) is adapted from victory-fork
+//! (https://github.com/fxceless/victory-fork, GPL-3.0-or-later) `9a9091d`,
+//! `crates/victory-shader/src/bvh.rs` `triangle`, after Mesa RADV (MIT, Copyright © 2021 Google)
+//! `intersect_ray_amd_software_tri`; changed 2026-11-27 (see `gpu/bvh.rs`).
 
 use super::lower::{err, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, Value};
@@ -212,15 +217,12 @@ impl Lw {
             let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
             let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
             let tw = words[9];
-            let z = lw.fc(0.0);
-            // `XCL_BVH_WATERTIGHT` (`gpu::bvh::watertight`); the direct translator's cache identity has it
-            let (t, det, i, j, hit) = if crate::gpu::bvh::watertight() {
-            // watertight test as gpu::bvh::triangle_hit and the HLSL prelude (Woop, Benthin, Wald
-            // 2013; adapted from victory-fork, https://github.com/fxceless/victory-fork,
-            // GPL-3.0-or-later, after Mesa RADV, MIT); no fused products, so a shared edge's
+            // `XCL_BVH_WATERTIGHT=1` (`gpu::bvh::watertight`): the watertight test as
+            // gpu::bvh::triangle_hit_watertight and the HLSL prelude; no fused products, so a shared edge's
             // function is exactly negated in the other triangle. Limit: the module drops
             // DisableMathRefactoring when it also uses FMad (shader.rs), and a driver may then
             // fuse these products, which loses the exact negation (no worse than before)
+            let (t, det, i, j, hit, z) = if crate::gpu::bvh::watertight() {
             lw.s.require(super::shader::Feature::DisableMathRefactoring);
             let ad = [lw.fabs(dir[0]), lw.fabs(dir[1]), lw.fabs(dir[2])];
             let xy = lw.fcmp(Pred::FOGe, ad[0], ad[1]);
@@ -240,6 +242,7 @@ impl Lw {
                 [x, y, z]
             };
             let pd = perm(lw, dir);
+            let z = lw.fc(0.0);
             let sw = lw.fcmp(Pred::FOLt, pd[2], z);
             let swap = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] { [lw.sel(sw, v[1], v[0]), lw.sel(sw, v[0], v[1]), v[2]] };
             let pd = swap(lw, pd);
@@ -298,9 +301,8 @@ impl Lw {
                 let fin = lw.fcmp(Pred::FOLt, ax, pinf);
                 hit = lw.land(hit, fin);
             }
-            (t, det, i, j, hit)
+            (t, det, i, j, hit, z)
             } else {
-            // Möller–Trumbore, the test before XCL_BVH_WATERTIGHT
             let e1 = lw.f3(v1, v0, Lw::fsub);
             let e2 = lw.f3(v2, v0, Lw::fsub);
             let p = lw.cross(dir, e2);
@@ -310,6 +312,7 @@ impl Lw {
             let i = lw.dot3(sv, p);
             let j = lw.dot3(dir, q);
             let t = lw.dot3(e2, q);
+            let z = lw.fc(0.0);
             let ij = lw.fadd(i, j);
             let dpos = lw.fcmp(Pred::FOGt, det, z);
             let c1 = lw.fcmp(Pred::FOGe, i, z);
@@ -324,7 +327,8 @@ impl Lw {
             let hn = lw.land(dneg, n1);
             let hn = lw.land(hn, n2);
             let hn = lw.land(hn, n3);
-            (t, det, i, j, lw.sel(dpos, hp, hn))
+            let hit = lw.sel(dpos, hp, hn);
+            (t, det, i, j, hit, z)
             };
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);

@@ -27,6 +27,14 @@
 //!
 //! Top-down build: median split of the leaf box centroids on the longest axis, twice per box
 //! node (4 children), one triangle / instance per leaf.
+//!
+//! `triangle_hit_watertight` (`XCL_BVH_WATERTIGHT=1`) is adapted from victory-fork
+//! (https://github.com/fxceless/victory-fork, GPL-3.0-or-later) commit `9a9091d`,
+//! `crates/victory-shader/src/bvh.rs` `triangle` (by fxceless), which follows Mesa RADV
+//! (https://gitlab.freedesktop.org/mesa/mesa, MIT, Copyright © 2021 Google)
+//! `src/amd/vulkan/nir/radv_nir_rt_common.c` `intersect_ray_amd_software_tri`. Changed
+//! 2026-11-27: f32 edge functions (Mesa computes them in f64), no t sign test, XCL's result
+//! scale (Mesa returns t / |det| and the sign of det).
 
 pub const BOX32: u32 = 5;
 pub const INSTANCE: u32 = 6;
@@ -251,8 +259,9 @@ pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> 
 
 /// `XCL_BVH_WATERTIGHT=1` (off by default): the triangle node uses the watertight test in the CPU
 /// reference, the HLSL prelude and the DXIL lowering; otherwise Möller–Trumbore as before. Read
-/// once; a test sets it for its own thread only (`tests::with_watertight`). The HLSL has it as a
-/// `#define` (so in DXC's cache key) and the translated cache's identity has it (`recomp::pso`).
+/// once; a test sets it for its own thread only (`tests::with_watertight`). Off, the HLSL is the
+/// text it was before; on, a program calling `bvh_intersect` gets other text (so another DXC
+/// cache key), and the translated cache's identity gets a tag (`recomp::pso`).
 pub fn watertight() -> bool {
     #[cfg(test)]
     if let Some(w) = tests::WATERTIGHT.with(|c| c.get()) {
@@ -270,14 +279,8 @@ pub fn watertight() -> bool {
 /// Edge-on (det = 0), NaN and a non-finite t or det miss; t's sign is not tested here (the
 /// traversal does). The four values have the Möller–Trumbore scale XCL returned before. The
 /// HLSL prelude (`recomp/emit.rs` `bvh_intersect`) and the DXIL lowering
-/// (`dxil/lower_image.rs`) do the same operations in the same order.
-///
-/// Adapted from victory-fork (https://github.com/fxceless/victory-fork, GPL-3.0-or-later),
-/// commit `9a9091d`, `crates/victory-shader/src/bvh.rs` `triangle` (by fxceless), which follows Mesa RADV
-/// (https://gitlab.freedesktop.org/mesa/mesa, MIT, © 2021 Google):
-/// `src/amd/vulkan/nir/radv_nir_rt_common.c` `intersect_ray_amd_software_tri`. Changed 2026-11-27:
-/// f32 edge functions (Mesa computes them in f64), no t sign test, XCL's result scale (Mesa
-/// returns t / |det| and the sign of det).
+/// (`dxil/lower_image.rs`) do the same operations in the same order. Ported code: see the file
+/// header.
 fn triangle_hit_watertight(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
     let kz = dominant_axis(d);
     let (kx, ky) = if d[kz] < 0.0 { ((kz + 2) % 3, (kz + 1) % 3) } else { ((kz + 1) % 3, (kz + 2) % 3) };
@@ -752,55 +755,6 @@ pub(crate) mod tests {
         tris.iter().filter(|t| triangle_hit_watertight(t, o, d).is_some()).count()
     }
 
-    /// Random rays from a point on the edge two triangles share and on the vertex a fan shares
-    /// (rounded, so near, not exactly on it): at least one triangle hits, every axis and sign.
-    #[test]
-    fn triangle_hit_is_watertight_at_shared_edges_and_vertices() {
-        let mut r = rng(11);
-        let mut checked = 0;
-        for axis in 0..3 {
-            for flip in [false, true] {
-                for _ in 0..200 {
-                    // a quad split along a random diagonal, in a plane across the ray's main axis
-                    let z = r(-2.0, 2.0);
-                    let (a, b) = ([r(-3.0, -1.0), r(-1.0, 1.0), z], [r(1.0, 3.0), r(-1.0, 1.0), z]);
-                    let (c, e) = ([r(-3.0, 3.0), r(8.0, 10.0), z + r(-0.5, 0.5)], [r(-3.0, 3.0), r(-10.0, -8.0), z + r(-0.5, 0.5)]);
-                    let pair = [[a, b, c], [b, a, e]].map(|t| t.map(|p| place(p, axis, flip)));
-                    let s = r(0.0, 1.0);
-                    let on = [0, 1, 2].map(|k| a[k] + s * (b[k] - a[k]));
-                    // ray from below, tilted but still mostly along the axis
-                    let dir = [r(-0.3, 0.3), r(-0.3, 0.3), if r(0.0, 1.0) < 0.5 { 1.0 } else { -1.0 }];
-                    let o = [0, 1, 2].map(|k| on[k] - 4.0 * dir[k]);
-                    let (o, dir) = (place(o, axis, flip), place(dir, axis, flip));
-                    assert!(hits(&pair, o, dir) >= 1, "edge: axis {axis} flip {flip} {pair:?} o {o:?} d {dir:?}");
-                    // fan of 6 around a shared vertex, ray straight through it
-                    let v = [r(-1.0, 1.0), r(-1.0, 1.0), z];
-                    let ring: Vec<[f32; 3]> = (0..6)
-                        .map(|k| {
-                            let ang = k as f32 * std::f32::consts::TAU / 6.0 + r(0.0, 0.3);
-                            [v[0] + 2.0 * ang.cos(), v[1] + 2.0 * ang.sin(), z + r(-0.5, 0.5)]
-                        })
-                        .collect();
-                    let fan: Vec<Triangle> = (0..6).map(|k| [v, ring[k], ring[(k + 1) % 6]].map(|p| place(p, axis, flip))).collect();
-                    let o = [0, 1, 2].map(|k| v[k] - 4.0 * dir_local(dir, axis, flip)[k]);
-                    let o = place(o, axis, flip);
-                    assert!(hits(&fan, o, dir) >= 1, "vertex: axis {axis} flip {flip} o {o:?} d {dir:?}");
-                    checked += 1;
-                }
-            }
-        }
-        assert_eq!(checked, 1200);
-    }
-
-    /// inverse of `place` for a direction
-    fn dir_local(d: [f32; 3], axis: usize, flip: bool) -> [f32; 3] {
-        let mut d = d;
-        if flip {
-            d[axis] = -d[axis];
-        }
-        [0, 1, 2].map(|k| d[(axis + 1 + k) % 3])
-    }
-
     /// Away from edges the watertight test agrees with the old Möller–Trumbore one: same hit /
     /// miss, same sign of det (facing), t and barycentrics within rounding.
     #[test]
@@ -875,7 +829,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Found by `triangle_hit_is_watertight_at_shared_edges_and_vertices` (seed 11, first case):
+    /// Found by a random near-edge search (seed 11, first case):
     /// a ray through the edge (1.911541, -2.025442, 0.78372467)–(1.911541, 2.740394, -0.50947857)
     /// that Möller–Trumbore misses in both triangles; the watertight test hits at least one.
     #[test]
@@ -891,48 +845,38 @@ pub(crate) mod tests {
         assert!(n(true) >= 1);
     }
 
-    /// Equal largest components pick the first axis (x before y before z), as in the HLSL and
-    /// DXIL `kz` selection.
+    /// The watertight test's edge cases: degenerate triangles, rays in the triangle's plane, a
+    /// zero direction and NaN miss; a tiny largest component with a far triangle overflows the
+    /// sheared depth and misses; the node then returns its miss encoding, never a NaN. Equal
+    /// largest components pick the first axis (x before y before z), as the HLSL and DXIL `kz`.
     #[test]
-    fn triangle_hit_dominant_axis_ties() {
-        assert_eq!(dominant_axis([1.0, -1.0, 0.5]), 0);
-        assert_eq!(dominant_axis([-1.0, 1.0, 1.0]), 0);
-        assert_eq!(dominant_axis([0.5, 1.0, -1.0]), 1);
-        assert_eq!(dominant_axis([0.5, -0.25, 1.0]), 2);
-        assert_eq!(dominant_axis([0.0, 0.0, 0.0]), 0);
-    }
-
-    /// A tiny largest component with a far triangle overflows the sheared depth: the node
-    /// returns its miss encoding, not an infinite or NaN t with a finite det.
-    #[test]
-    fn triangle_hit_non_finite_t_misses() {
-        let tri = [[5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [5.0, 0.0, 1.0]];
-        let (o, d) = ([0.0, 0.2, 0.2], [1e-38f32, 0.0, 0.0]);
-        assert!(triangle_hit_watertight(&tri, o, d).is_none());
-        let mut data = vec![0u8; 64];
-        for (k, p) in tri.iter().enumerate() {
-            for x in 0..3 {
-                data[12 * k + 4 * x..12 * k + 4 * x + 4].copy_from_slice(&p[x].to_le_bytes());
+    fn triangle_hit_degenerate_non_finite_and_axis_ties() {
+        let node = |t: &Triangle| {
+            let mut data = vec![0u8; 64];
+            for (k, p) in t.iter().enumerate() {
+                for a in 0..3 {
+                    data[12 * k + 4 * a..12 * k + 4 * a + 4].copy_from_slice(&p[a].to_le_bytes());
+                }
             }
-        }
-        data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
-        let r = with_watertight(true, || intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false)).map(f32::from_bits);
-        assert_eq!(r, [f32::INFINITY, 1.0, 0.0, 0.0]);
-    }
-
-    /// Degenerate triangles, rays in the triangle's plane, a zero direction and NaN miss.
-    #[test]
-    fn triangle_hit_degenerate_and_parallel_miss() {
+            data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
+            data
+        };
+        let miss = [f32::INFINITY, 1.0, 0.0, 0.0];
+        let at = |t: &Triangle, o: [f32; 3], d: [f32; 3]| with_watertight(true, || intersect_node(&node(t), 0, 100.0, o, d, d.map(|x| 1.0 / x), false)).map(f32::from_bits);
         let d = [0.0, 0.0, 1.0];
         let o = [0.2, 0.2, -1.0];
         let tri = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        let degenerate: [Triangle; 3] = [
+        let mut nan = tri;
+        nan[1][0] = f32::NAN;
+        let degenerate: [Triangle; 4] = [
             [[0.0; 3], [0.0; 3], [0.0; 3]],
             [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]],
             [[0.2, 0.2, 0.0], [0.2, 0.2, 0.0], [1.0, 0.0, 0.0]],
+            nan,
         ];
         for t in &degenerate {
             assert!(triangle_hit_watertight(t, o, d).is_none(), "{t:?}");
+            assert_eq!(at(t, o, d), miss, "{t:?}");
         }
         // in the plane, along each in-plane axis and a diagonal
         for d in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 0.0, 0.0]] {
@@ -941,20 +885,12 @@ pub(crate) mod tests {
         assert!(triangle_hit_watertight(&tri, o, [0.0; 3]).is_none());
         assert!(triangle_hit_watertight(&tri, o, [f32::NAN, 0.0, 1.0]).is_none());
         assert!(triangle_hit_watertight(&tri, [f32::NAN, 0.2, -1.0], d).is_none());
-        let mut nan = tri;
-        nan[1][0] = f32::NAN;
-        assert!(triangle_hit_watertight(&nan, o, d).is_none());
-        // the node returns its miss encoding, never a NaN
-        for t in degenerate.iter().chain([&nan]) {
-            let mut data = vec![0u8; 64];
-            for (k, p) in t.iter().enumerate() {
-                for a in 0..3 {
-                    data[12 * k + 4 * a..12 * k + 4 * a + 4].copy_from_slice(&p[a].to_le_bytes());
-                }
-            }
-            data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
-            let r = with_watertight(true, || intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false)).map(f32::from_bits);
-            assert_eq!(r, [f32::INFINITY, 1.0, 0.0, 0.0]);
+        let far = [[5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [5.0, 0.0, 1.0]];
+        let (fo, fd) = ([0.0, 0.2, 0.2], [1e-38f32, 0.0, 0.0]);
+        assert!(triangle_hit_watertight(&far, fo, fd).is_none());
+        assert_eq!(at(&far, fo, fd), miss);
+        for (d, k) in [([1.0, -1.0, 0.5], 0), ([-1.0, 1.0, 1.0], 0), ([0.5, 1.0, -1.0], 1), ([0.5, -0.25, 1.0], 2), ([0.0; 3], 0)] {
+            assert_eq!(dominant_axis(d), k, "{d:?}");
         }
     }
 

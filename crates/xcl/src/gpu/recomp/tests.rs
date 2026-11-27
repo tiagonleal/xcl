@@ -5622,6 +5622,14 @@ fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
         w(&mut mem, 0x40 * (axis + 1), &ff(&verts));
         w(&mut mem, 0x40 * (axis + 1) + 48, &[0x80, 0, 1, 0x0909]);
     }
+    // nodes 4 and 5: the pinned pair of `bvh.rs` that Möller–Trumbore misses in both triangles,
+    // each as type 0 in the same vertex order (so the old test rounds as there), last two lanes
+    let (pa, pb) = ([1.911541f32, -2.025442, 0.78372467], [1.911541f32, 2.740394, -0.50947857]);
+    for (n, tri) in [[pa, pb, [2.1104007, -1.6796683, 9.487581]], [pb, pa, [1.5455573, 0.7414906, -8.11272]]].iter().enumerate() {
+        w(&mut mem, 0x100 + 0x40 * n, &ff(&tri.concat()));
+        w(&mut mem, 0x100 + 0x40 * n + 48, &[0, 0, 1, 0x0909]);
+    }
+    let pinned_ray = ([5.911541f32, -0.8080063, 0.59203976], [-1.0f32, -0.13060194, 0.000772506], 3usize);
     let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
     let mut st = KernelState::default();
@@ -5639,9 +5647,12 @@ fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
             d[axis] = if (l / 6) % 2 == 0 { 1.0 } else { -1.0 };
             ray = ([0, 1, 2].map(|a| on[a] - 3.0 * d[a]), d, axis);
         }
+        if l >= 62 {
+            ray = pinned_ray;
+        }
         let (o, d, axis) = ray;
         let inv = d.map(|x| 1.0 / x);
-        let node = ((0x40 * (axis as u32 + 1)) >> 3) | (l as u32 % 2);
+        let node = if axis == 3 { (0x100 + 0x40 * (l as u32 % 2)) >> 3 } else { ((0x40 * (axis as u32 + 1)) >> 3) | (l as u32 % 2) };
         v[0] = node;
         for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
             v[1 + k] = x.to_bits();
@@ -5660,20 +5671,27 @@ fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
             assert!(ch[0] || ch[1], "lanes {} and {l}: CPU ray through the shared edge missed both", l - 1);
         }
     }
+    // the pinned lanes separate the tests: the old one (switch off) misses both there
+    let ((n0, o, d, inv), n1) = (rays[62], rays[63].0);
+    let mt = |n| f32::from_bits(bvh::tests::with_watertight(false, || bvh::intersect_node(&data, n, 100.0, o, d, inv, true))[0]);
+    assert!(mt(n0).is_infinite() && mt(n1).is_infinite(), "Möller–Trumbore hits the pinned pair");
 }
 
-/// `XCL_BVH_WATERTIGHT` selects the triangle test in the HLSL (a `#define`, so the text and
-/// DXC's cache key differ) and in the direct DXIL (other bytes); off is Möller–Trumbore.
+/// `XCL_BVH_WATERTIGHT` selects the triangle test in the HLSL and in the direct DXIL. Off, the
+/// HLSL has main's Möller–Trumbore text and nothing of the switch (DXC cache keys unchanged);
+/// on, only a program that calls `bvh_intersect` changes.
 #[test]
 fn bvh_watertight_switch_changes_the_hlsl_and_the_dxil() {
     use crate::gpu::bvh::tests::with_watertight;
     let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
-    let hlsl = |on| with_watertight(on, || translate(&code, &Options::default()).unwrap().hlsl);
-    let (off, on) = (hlsl(false), hlsl(true));
-    assert!(off.contains("#define XCL_BVH_WATERTIGHT 0") && on.contains("#define XCL_BVH_WATERTIGHT 1"));
-    assert!(off.contains("#if XCL_BVH_WATERTIGHT") && off.contains("p = cross(d, e2)"));
-    assert_ne!(off, on);
+    let hlsl = |code: &[u8], on| with_watertight(on, || translate(code, &Options::default()).unwrap().hlsl);
+    let (off, on) = (hlsl(&code, false), hlsl(&code, true));
+    assert!(!off.contains("XCL_BVH_WATERTIGHT") && !on.contains("XCL_BVH_WATERTIGHT"));
+    assert!(off.contains(super::emit::BVH_TRIANGLE_MT) && !off.contains("precise float sz"));
+    assert!(on.contains("precise float sz") && !on.contains("p = cross(d, e2)"));
+    let plain = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None)]);
+    assert_eq!(hlsl(&plain, false), hlsl(&plain, true), "a program without BVH changed");
     let dxil = |on| with_watertight(on, || runner::direct_kernel(&code, true));
     match (dxil(false), dxil(true)) {
         (Ok(off), Ok(on)) => assert_ne!(off, on, "direct DXIL is the same with and without the switch"),
