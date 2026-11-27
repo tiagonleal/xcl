@@ -29,31 +29,40 @@ fn line_readable(p: u64, read: &dyn Fn(u64, &mut [u8]) -> bool) -> bool {
     read(p & !0xF, &mut b)
 }
 
-/// The pointers to dump, named, without repeats: registers, the faulting address, and the
-/// faulting address (below 4 GiB) under the upper half of each register that is a readable pointer.
+/// The pointers to dump, named, without repeats: the faulting address, the faulting address
+/// (from 64 KiB to 4 GiB) under the upper half of each register that is a readable pointer, then
+/// the registers. The ones this report exists for come first, so the line cap never cuts them.
 pub fn candidates(regs: &[(&str, u64)], fault: Option<u64>, read: &dyn Fn(u64, &mut [u8]) -> bool) -> Vec<(String, u64)> {
     let mut out: Vec<(String, u64)> = Vec::new();
-    let push = |out: &mut Vec<(String, u64)>, name: String, p: u64| {
-        if !out.iter().any(|(_, q)| *q == p) && line_readable(p, read) {
+    let push = |out: &mut Vec<(String, u64)>, name: String, p: u64| -> bool {
+        let new = !out.iter().any(|(_, q)| *q == p) && line_readable(p, read);
+        if new {
             out.push((name, p));
         }
+        new
     };
-    for (n, v) in regs {
-        push(&mut out, (*n).to_string(), *v);
-    }
     if let Some(f) = fault {
         push(&mut out, "fault".into(), f);
-        if f >> 32 == 0 {
+        // below 64 KiB a fault is a null pointer plus an offset, not a truncated pointer
+        if f >> 32 == 0 && f >= 0x10000 {
             let mut highs: Vec<u64> = Vec::new();
             for (n, v) in regs {
                 let hi = v >> 32;
-                if hi == 0 || highs.contains(&hi) || highs.len() >= MAX_REBASED || !line_readable(*v, read) {
+                if highs.len() >= MAX_REBASED {
+                    break;
+                }
+                if hi == 0 || highs.contains(&hi) || !line_readable(*v, read) {
                     continue;
                 }
-                highs.push(hi);
-                push(&mut out, format!("fault under {n}'s upper half"), (hi << 32) | f);
+                // only rebased addresses that were dumped count against the budget
+                if push(&mut out, format!("fault under {n}'s upper half"), (hi << 32) | f) {
+                    highs.push(hi);
+                }
             }
         }
+    }
+    for (n, v) in regs {
+        push(&mut out, (*n).to_string(), *v);
     }
     out
 }
@@ -106,15 +115,20 @@ pub fn report(on: bool, count: &AtomicUsize, regs: &[(&str, u64)], fault: Option
     format(&candidates(regs, fault, read), read, MAX_LINES)
 }
 
-/// Reads the current process only where `gpu::shader::readable` says the memory is committed
-/// and readable: a fault inside the unhandled-exception filter would end the report.
+/// Reads the current process through `ReadProcessMemory`, which fails instead of faulting where
+/// memory is not readable – also when another thread of the title frees it meanwhile, which a
+/// `readable` check before a plain copy would miss. One call per read and no `VirtualQuery`
+/// walk, which in a title's large blocks takes milliseconds.
 fn read_here(a: u64, buf: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let Ok(p) = usize::try_from(a) else { return false };
-    if p < 0x10000 || !crate::gpu::shader::readable(p, buf.len()) {
+    if p < 0x10000 {
         return false;
     }
-    unsafe { std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr(), buf.len()) };
-    true
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), p as *const std::ffi::c_void, buf.as_mut_ptr().cast(), buf.len(), &mut got) };
+    ok != 0 && got == buf.len()
 }
 
 /// Logs the dump for a title's unhandled exception, when `XCL_FAULT_DUMP=1`.
@@ -124,7 +138,12 @@ pub fn log(regs: &[(&str, u64)], fault: Option<u64>) {
     if !enabled() {
         return;
     }
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // a fault while a report is being written (on this thread or another) gets no second one
+    let _g = match LOCK.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
     for l in report(true, &COUNT, regs, fault, &read_here) {
         crate::xlog_error!("{l}");
     }
@@ -137,7 +156,7 @@ mod tests {
     // memory [base, base + len) is readable and holds its own address's low bytes
     fn mem(ranges: &'static [(u64, u64)]) -> impl Fn(u64, &mut [u8]) -> bool {
         move |a, buf| {
-            let end = a + buf.len() as u64;
+            let Some(end) = a.checked_add(buf.len() as u64) else { return false };
             if !ranges.iter().any(|&(b, l)| a >= b && end <= b + l) {
                 return false;
             }
@@ -153,33 +172,73 @@ mod tests {
         let r = mem(&[(0x1000, 0x1000)]);
         let regs = [("rax", 0x1010), ("rbx", 0x9000), ("rcx", 0x1010), ("rdx", 0x1800)];
         let c = candidates(&regs, Some(0x1800), &r);
+        assert_eq!(c, vec![("fault".to_string(), 0x1800), ("rax".to_string(), 0x1010)]);
+        let c = candidates(&regs, None, &r);
         assert_eq!(c, vec![("rax".to_string(), 0x1010), ("rdx".to_string(), 0x1800)]);
-        let c = candidates(&regs, Some(0x1F00), &r);
-        assert_eq!(c.last().unwrap(), &("fault".to_string(), 0x1F00));
     }
 
     #[test]
     fn candidates_rebase_a_truncated_fault_under_pointer_upper_halves() {
-        let r = mem(&[(0x7_0000_1000, 0x1000), (0x8_0000_0000, 0x100), (0x9_0000_2000, 0x100)]);
-        let regs = [("rax", 0x7_0000_1010), ("rbx", 0x7_0000_1020), ("rcx", 0x8_0000_0000), ("rdx", 0x9_0000_0000)];
-        let c = candidates(&regs, Some(0x2000), &r);
+        let r = mem(&[(0x7_0001_0000, 0x1000), (0x8_0000_0000, 0x100), (0x9_0001_0000, 0x100)]);
+        let regs = [("rax", 0x7_0001_0010), ("rbx", 0x7_0001_0020), ("rcx", 0x8_0000_0000), ("rdx", 0x9_0000_0000)];
+        // rax and rbx share an upper half; rdx does not point at readable memory, so its upper
+        // half is not tried although 9<<32 | fault is readable
+        let c = candidates(&regs, Some(0x1_0080), &r);
         let names: Vec<&str> = c.iter().map(|(n, _)| n.as_str()).collect();
-        // rax and rbx share an upper half, rdx is not readable, 9<<32|0x2000 is
-        assert_eq!(names, ["rax", "rbx", "rcx"]);
-        let c = candidates(&regs, Some(0x1080), &r);
-        assert_eq!(c[3], ("fault under rax's upper half".to_string(), 0x7_0000_1080));
-        assert_eq!(c.len(), 4);
+        assert_eq!(names, ["fault under rax's upper half", "rax", "rbx", "rcx"]);
+        assert_eq!(c[0].1, 0x7_0001_0080);
+        let c = candidates(&regs, Some(0x2_0000), &r);
+        assert_eq!(c.len(), 3);
         // no rebasing above 4 GiB
-        let c = candidates(&regs, Some(0x1_0000_1080), &r);
+        let c = candidates(&regs, Some(0x1_0001_0080), &r);
         assert_eq!(c.len(), 3);
     }
 
     #[test]
-    fn candidates_rebase_at_most_a_few() {
-        static R: [(u64, u64); 6] = [(0x1_0000_0000, 0x2000), (0x2_0000_0000, 0x2000), (0x3_0000_0000, 0x2000), (0x4_0000_0000, 0x2000), (0x5_0000_0000, 0x2000), (0x6_0000_0000, 0x2000)];
+    fn unreadable_rebases_do_not_use_up_the_budget() {
+        static R: [(u64, u64); 7] = [(1 << 32, 0x100), (2 << 32, 0x100), (3 << 32, 0x100), (4 << 32, 0x100), (5 << 32, 0x100), (6 << 32, 0x100), ((5 << 32) | 0x2_0000, 0x100)];
         let r = mem(&R);
         let regs: Vec<(&str, u64)> = ["a", "b", "c", "d", "e", "f"].iter().zip(1u64..).map(|(n, i)| (*n, i << 32)).collect();
-        let c = candidates(&regs, Some(0x1000), &r);
+        let c = candidates(&regs, Some(0x2_0000), &r);
+        assert_eq!(c[0], ("fault under e's upper half".to_string(), (5 << 32) | 0x2_0000));
+    }
+
+    #[test]
+    fn a_fault_below_64k_is_not_rebased() {
+        let r = mem(&[(0x7_0000_0000, 0x10000)]);
+        let c = candidates(&[("rax", 0x7_0000_1000)], Some(0x80), &r);
+        assert_eq!(c, vec![("rax".to_string(), 0x7_0000_1000)]);
+    }
+
+    #[test]
+    fn the_rebased_fault_survives_the_cap() {
+        let r = mem(&[(1 << 32, 1 << 32)]);
+        let names: Vec<String> = (0..16).map(|i| format!("r{i}")).collect();
+        let regs: Vec<(&str, u64)> = names.iter().zip(0u64..).map(|(n, i)| (n.as_str(), 0x1_0000_5000 + i * 0x10_0000)).collect();
+        let c = candidates(&regs, Some(0x2_0000), &r);
+        assert_eq!(c.len(), 17);
+        let l = format(&c, &r, MAX_LINES);
+        assert_eq!(l[0], "fault dump: fault under r0's upper half=0x100020000");
+        assert_eq!(l.last().unwrap(), "fault dump: line limit reached");
+    }
+
+    #[test]
+    fn format_stops_at_the_top_of_the_address_space() {
+        let all = |_: u64, b: &mut [u8]| {
+            b.fill(0);
+            true
+        };
+        let l = format(&[("rax".into(), u64::MAX - 8)], &all, MAX_LINES);
+        assert_eq!(l.len(), 1 + 9);
+        assert!(l.last().unwrap().starts_with("fault dump: 0xffffffffffffffe0:") && l.last().unwrap().ends_with(" <=="));
+    }
+
+    #[test]
+    fn candidates_rebase_at_most_a_few() {
+        static R: [(u64, u64); 6] = [(0x1_0000_0000, 0x2_0000), (0x2_0000_0000, 0x2_0000), (0x3_0000_0000, 0x2_0000), (0x4_0000_0000, 0x2_0000), (0x5_0000_0000, 0x2_0000), (0x6_0000_0000, 0x2_0000)];
+        let r = mem(&R);
+        let regs: Vec<(&str, u64)> = ["a", "b", "c", "d", "e", "f"].iter().zip(1u64..).map(|(n, i)| (*n, i << 32)).collect();
+        let c = candidates(&regs, Some(0x1_0000), &r);
         assert_eq!(c.iter().filter(|(n, _)| n.starts_with("fault under")).count(), MAX_REBASED);
     }
 

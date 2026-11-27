@@ -105,7 +105,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12),
                 ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
             ];
-            dump_regs.extend_from_slice(&regs);
+            if fault_dump::enabled() {
+                dump_regs.extend_from_slice(&regs);
+            }
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
