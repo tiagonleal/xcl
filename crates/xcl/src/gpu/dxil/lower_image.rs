@@ -223,112 +223,112 @@ impl Lw {
             // DisableMathRefactoring when it also uses FMad (shader.rs), and a driver may then
             // fuse these products, which loses the exact negation (no worse than before)
             let (t, det, i, j, hit, z) = if crate::gpu::bvh::watertight() {
-            lw.s.require(super::shader::Feature::DisableMathRefactoring);
-            let ad = [lw.fabs(dir[0]), lw.fabs(dir[1]), lw.fabs(dir[2])];
-            let xy = lw.fcmp(Pred::FOGe, ad[0], ad[1]);
-            let xz = lw.fcmp(Pred::FOGe, ad[0], ad[2]);
-            let yz = lw.fcmp(Pred::FOGe, ad[1], ad[2]);
-            let nxy = lw.lnot(xy);
-            let kz0 = lw.land(xy, xz);
-            let kz1 = lw.land(nxy, yz);
-            // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
-            let perm = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] {
-                let x = lw.sel(kz1, v[2], v[0]);
-                let x = lw.sel(kz0, v[1], x);
-                let y = lw.sel(kz1, v[0], v[1]);
-                let y = lw.sel(kz0, v[2], y);
-                let z = lw.sel(kz1, v[1], v[2]);
-                let z = lw.sel(kz0, v[0], z);
-                [x, y, z]
-            };
-            let pd = perm(lw, dir);
-            let z = lw.fc(0.0);
-            let sw = lw.fcmp(Pred::FOLt, pd[2], z);
-            let swap = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] { [lw.sel(sw, v[1], v[0]), lw.sel(sw, v[0], v[1]), v[2]] };
-            let pd = swap(lw, pd);
-            let one = lw.fc(1.0);
-            let sz = lw.fdiv(one, pd[2]);
-            let sx = lw.fmul(pd[0], sz);
-            let sy = lw.fmul(pd[1], sz);
-            let mut sh = [[z; 3]; 3];
-            for (k, v) in [v0, v1, v2].into_iter().enumerate() {
-                let r = lw.f3(v, o, Lw::fsub);
-                let r = perm(lw, r);
-                let r = swap(lw, r);
-                let ax = lw.fmul(sx, r[2]);
-                let ay = lw.fmul(sy, r[2]);
-                sh[k] = [lw.fsub(r[0], ax), lw.fsub(r[1], ay), lw.fmul(sz, r[2])];
-            }
-            let [p0, p1, p2] = sh;
-            let edge = |lw: &mut Lw, a: [Value; 3], b: [Value; 3]| {
-                let m0 = lw.fmul(a[0], b[1]);
-                let m1 = lw.fmul(a[1], b[0]);
-                lw.fsub(m0, m1)
-            };
-            let u = edge(lw, p2, p1);
-            let i = edge(lw, p0, p2);
-            let j = edge(lw, p1, p0);
-            let mut neg = lw.fcmp(Pred::FOLt, u, z);
-            let mut pos = lw.fcmp(Pred::FOGt, u, z);
-            for e in [i, j] {
-                let n = lw.fcmp(Pred::FOLt, e, z);
-                neg = lw.lor(neg, n);
-                let p = lw.fcmp(Pred::FOGt, e, z);
-                pos = lw.lor(pos, p);
-            }
-            let mixed = lw.land(neg, pos);
-            let ij = lw.fadd(i, j);
-            let det = lw.fadd(u, ij);
-            let tu = lw.fmul(u, p0[2]);
-            let ti = lw.fmul(i, p1[2]);
-            let tj = lw.fmul(j, p2[2]);
-            let t = lw.fadd(tu, ti);
-            let t = lw.fadd(t, tj);
-            // back to Möller–Trumbore's scale after the decision; edge-on (det = 0), NaN and a
-            // non-finite t or det miss
-            let dpos = lw.fcmp(Pred::FOGt, det, z);
-            let dneg = lw.fcmp(Pred::FOLt, det, z);
-            let dnz = lw.lor(dpos, dneg);
-            let inside = lw.lnot(mixed);
-            let hit = lw.land(inside, dnz);
-            let s = lw.fabs(pd[2]);
-            let (t, det, i, j) = (lw.fmul(t, s), lw.fmul(det, s), lw.fmul(i, s), lw.fmul(j, s));
-            let pinf = lw.fc(f32::INFINITY);
-            let mut hit = hit;
-            for x in [t, det] {
-                // |x| < inf is false for inf and NaN
-                let ax = lw.fabs(x);
-                let fin = lw.fcmp(Pred::FOLt, ax, pinf);
-                hit = lw.land(hit, fin);
-            }
-            (t, det, i, j, hit, z)
+                lw.s.require(super::shader::Feature::DisableMathRefactoring);
+                let ad = [lw.fabs(dir[0]), lw.fabs(dir[1]), lw.fabs(dir[2])];
+                let xy = lw.fcmp(Pred::FOGe, ad[0], ad[1]);
+                let xz = lw.fcmp(Pred::FOGe, ad[0], ad[2]);
+                let yz = lw.fcmp(Pred::FOGe, ad[1], ad[2]);
+                let nxy = lw.lnot(xy);
+                let kz0 = lw.land(xy, xz);
+                let kz1 = lw.land(nxy, yz);
+                // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
+                let perm = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] {
+                    let x = lw.sel(kz1, v[2], v[0]);
+                    let x = lw.sel(kz0, v[1], x);
+                    let y = lw.sel(kz1, v[0], v[1]);
+                    let y = lw.sel(kz0, v[2], y);
+                    let z = lw.sel(kz1, v[1], v[2]);
+                    let z = lw.sel(kz0, v[0], z);
+                    [x, y, z]
+                };
+                let pd = perm(lw, dir);
+                let z = lw.fc(0.0);
+                let sw = lw.fcmp(Pred::FOLt, pd[2], z);
+                let swap = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] { [lw.sel(sw, v[1], v[0]), lw.sel(sw, v[0], v[1]), v[2]] };
+                let pd = swap(lw, pd);
+                let one = lw.fc(1.0);
+                let sz = lw.fdiv(one, pd[2]);
+                let sx = lw.fmul(pd[0], sz);
+                let sy = lw.fmul(pd[1], sz);
+                let mut sh = [[z; 3]; 3];
+                for (k, v) in [v0, v1, v2].into_iter().enumerate() {
+                    let r = lw.f3(v, o, Lw::fsub);
+                    let r = perm(lw, r);
+                    let r = swap(lw, r);
+                    let ax = lw.fmul(sx, r[2]);
+                    let ay = lw.fmul(sy, r[2]);
+                    sh[k] = [lw.fsub(r[0], ax), lw.fsub(r[1], ay), lw.fmul(sz, r[2])];
+                }
+                let [p0, p1, p2] = sh;
+                let edge = |lw: &mut Lw, a: [Value; 3], b: [Value; 3]| {
+                    let m0 = lw.fmul(a[0], b[1]);
+                    let m1 = lw.fmul(a[1], b[0]);
+                    lw.fsub(m0, m1)
+                };
+                let u = edge(lw, p2, p1);
+                let i = edge(lw, p0, p2);
+                let j = edge(lw, p1, p0);
+                let mut neg = lw.fcmp(Pred::FOLt, u, z);
+                let mut pos = lw.fcmp(Pred::FOGt, u, z);
+                for e in [i, j] {
+                    let n = lw.fcmp(Pred::FOLt, e, z);
+                    neg = lw.lor(neg, n);
+                    let p = lw.fcmp(Pred::FOGt, e, z);
+                    pos = lw.lor(pos, p);
+                }
+                let mixed = lw.land(neg, pos);
+                let ij = lw.fadd(i, j);
+                let det = lw.fadd(u, ij);
+                let tu = lw.fmul(u, p0[2]);
+                let ti = lw.fmul(i, p1[2]);
+                let tj = lw.fmul(j, p2[2]);
+                let t = lw.fadd(tu, ti);
+                let t = lw.fadd(t, tj);
+                // back to Möller–Trumbore's scale after the decision; edge-on (det = 0), NaN and a
+                // non-finite t or det miss
+                let dpos = lw.fcmp(Pred::FOGt, det, z);
+                let dneg = lw.fcmp(Pred::FOLt, det, z);
+                let dnz = lw.lor(dpos, dneg);
+                let inside = lw.lnot(mixed);
+                let hit = lw.land(inside, dnz);
+                let s = lw.fabs(pd[2]);
+                let (t, det, i, j) = (lw.fmul(t, s), lw.fmul(det, s), lw.fmul(i, s), lw.fmul(j, s));
+                let pinf = lw.fc(f32::INFINITY);
+                let mut hit = hit;
+                for x in [t, det] {
+                    // |x| < inf is false for inf and NaN
+                    let ax = lw.fabs(x);
+                    let fin = lw.fcmp(Pred::FOLt, ax, pinf);
+                    hit = lw.land(hit, fin);
+                }
+                (t, det, i, j, hit, z)
             } else {
-            let e1 = lw.f3(v1, v0, Lw::fsub);
-            let e2 = lw.f3(v2, v0, Lw::fsub);
-            let p = lw.cross(dir, e2);
-            let det = lw.dot3(e1, p);
-            let sv = lw.f3(o, v0, Lw::fsub);
-            let q = lw.cross(sv, e1);
-            let i = lw.dot3(sv, p);
-            let j = lw.dot3(dir, q);
-            let t = lw.dot3(e2, q);
-            let z = lw.fc(0.0);
-            let ij = lw.fadd(i, j);
-            let dpos = lw.fcmp(Pred::FOGt, det, z);
-            let c1 = lw.fcmp(Pred::FOGe, i, z);
-            let c2 = lw.fcmp(Pred::FOGe, j, z);
-            let c3 = lw.fcmp(Pred::FOLe, ij, det);
-            let hp = lw.land(c1, c2);
-            let hp = lw.land(hp, c3);
-            let dneg = lw.fcmp(Pred::FOLt, det, z);
-            let n1 = lw.fcmp(Pred::FOLe, i, z);
-            let n2 = lw.fcmp(Pred::FOLe, j, z);
-            let n3 = lw.fcmp(Pred::FOGe, ij, det);
-            let hn = lw.land(dneg, n1);
-            let hn = lw.land(hn, n2);
-            let hn = lw.land(hn, n3);
-            let hit = lw.sel(dpos, hp, hn);
-            (t, det, i, j, hit, z)
+                let e1 = lw.f3(v1, v0, Lw::fsub);
+                let e2 = lw.f3(v2, v0, Lw::fsub);
+                let p = lw.cross(dir, e2);
+                let det = lw.dot3(e1, p);
+                let sv = lw.f3(o, v0, Lw::fsub);
+                let q = lw.cross(sv, e1);
+                let i = lw.dot3(sv, p);
+                let j = lw.dot3(dir, q);
+                let t = lw.dot3(e2, q);
+                let z = lw.fc(0.0);
+                let ij = lw.fadd(i, j);
+                let dpos = lw.fcmp(Pred::FOGt, det, z);
+                let c1 = lw.fcmp(Pred::FOGe, i, z);
+                let c2 = lw.fcmp(Pred::FOGe, j, z);
+                let c3 = lw.fcmp(Pred::FOLe, ij, det);
+                let hp = lw.land(c1, c2);
+                let hp = lw.land(hp, c3);
+                let dneg = lw.fcmp(Pred::FOLt, det, z);
+                let n1 = lw.fcmp(Pred::FOLe, i, z);
+                let n2 = lw.fcmp(Pred::FOLe, j, z);
+                let n3 = lw.fcmp(Pred::FOGe, ij, det);
+                let hn = lw.land(dneg, n1);
+                let hn = lw.land(hn, n2);
+                let hn = lw.land(hn, n3);
+                let hit = lw.sel(dpos, hp, hn);
+                (t, det, i, j, hit, z)
             };
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
