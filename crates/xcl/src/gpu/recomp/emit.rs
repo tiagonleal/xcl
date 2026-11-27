@@ -6217,12 +6217,34 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
         uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
         float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
-        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
-        float det = dot(e1, p);
-        float3 sv = o - v0, q = cross(sv, e1);
-        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
-        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
-        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        // watertight test as gpu::bvh::triangle_hit (Woop, Benthin, Wald 2013; adapted from
+        // victory-fork, https://github.com/fxceless/victory-fork, GPL-3.0-or-later, after Mesa
+        // RADV, MIT): shear so the ray runs along its largest axis, signs of the edge functions
+        // decide; `precise` so that no product is fused and a shared edge's function is exactly
+        // negated in the other triangle
+        float3 ad = abs(d);
+        uint kz = ad.x >= ad.y ? (ad.x >= ad.z ? 0u : 2u) : (ad.y >= ad.z ? 1u : 2u);
+        // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
+        float3 pd = kz == 0u ? d.yzx : (kz == 1u ? d.zxy : d.xyz);
+        bool sw = pd.z < 0.0f;
+        pd = sw ? pd.yxz : pd;
+        precise float sz = 1.0f / pd.z;
+        precise float sx = pd.x * sz, sy = pd.y * sz;
+        float3 r0 = v0 - o, r1 = v1 - o, r2 = v2 - o;
+        r0 = kz == 0u ? r0.yzx : (kz == 1u ? r0.zxy : r0); r0 = sw ? r0.yxz : r0;
+        r1 = kz == 0u ? r1.yzx : (kz == 1u ? r1.zxy : r1); r1 = sw ? r1.yxz : r1;
+        r2 = kz == 0u ? r2.yzx : (kz == 1u ? r2.zxy : r2); r2 = sw ? r2.yxz : r2;
+        precise float3 p0 = float3(r0.x - sx * r0.z, r0.y - sy * r0.z, sz * r0.z);
+        precise float3 p1 = float3(r1.x - sx * r1.z, r1.y - sy * r1.z, sz * r1.z);
+        precise float3 p2 = float3(r2.x - sx * r2.z, r2.y - sy * r2.z, sz * r2.z);
+        precise float u = p2.x * p1.y - p2.y * p1.x;
+        precise float i = p0.x * p2.y - p0.y * p2.x;
+        precise float j = p1.x * p0.y - p1.y * p0.x;
+        bool mixed = (u < 0.0f || i < 0.0f || j < 0.0f) && (u > 0.0f || i > 0.0f || j > 0.0f);
+        precise float det = u + (i + j);
+        precise float t = (u * p0.z + i * p1.z) + j * p2.z;
+        // edge-on (det = 0) and NaN miss
+        bool hit = !mixed && (det > 0.0f || det < 0.0f);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
         uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);

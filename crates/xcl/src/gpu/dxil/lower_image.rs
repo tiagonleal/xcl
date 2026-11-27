@@ -60,23 +60,6 @@ impl Lw {
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
-    fn cross(&mut self, a: [Value; 3], b: [Value; 3]) -> [Value; 3] {
-        let x0 = self.fmul(a[1], b[2]);
-        let x1 = self.fmul(a[2], b[1]);
-        let x = self.fsub(x0, x1);
-        let y0 = self.fmul(a[2], b[0]);
-        let y1 = self.fmul(a[0], b[2]);
-        let y = self.fsub(y0, y1);
-        let z0 = self.fmul(a[0], b[1]);
-        let z1 = self.fmul(a[1], b[0]);
-        let z = self.fsub(z0, z1);
-        [x, y, z]
-    }
-    /// HLSL `dot(float3, float3)` = `Dot3`.
-    fn dot3(&mut self, a: [Value; 3], b: [Value; 3]) -> Value {
-        let f32 = self.s.m.f32();
-        self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
-    }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
@@ -212,31 +195,77 @@ impl Lw {
             let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
             let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
             let tw = words[9];
-            let e1 = lw.f3(v1, v0, Lw::fsub);
-            let e2 = lw.f3(v2, v0, Lw::fsub);
-            let p = lw.cross(dir, e2);
-            let det = lw.dot3(e1, p);
-            let sv = lw.f3(o, v0, Lw::fsub);
-            let q = lw.cross(sv, e1);
-            let i = lw.dot3(sv, p);
-            let j = lw.dot3(dir, q);
-            let t = lw.dot3(e2, q);
+            // watertight test as gpu::bvh::triangle_hit and the HLSL prelude (Woop, Benthin, Wald
+            // 2013; adapted from victory-fork, https://github.com/fxceless/victory-fork,
+            // GPL-3.0-or-later, after Mesa RADV, MIT); no fused products, so a shared edge's
+            // function is exactly negated in the other triangle
+            lw.s.require(super::shader::Feature::DisableMathRefactoring);
+            let ad = [lw.fabs(dir[0]), lw.fabs(dir[1]), lw.fabs(dir[2])];
+            let xy = lw.fcmp(Pred::FOGe, ad[0], ad[1]);
+            let xz = lw.fcmp(Pred::FOGe, ad[0], ad[2]);
+            let yz = lw.fcmp(Pred::FOGe, ad[1], ad[2]);
+            let nxy = lw.lnot(xy);
+            let kz0 = lw.land(xy, xz);
+            let kz1 = lw.land(nxy, yz);
+            // (kz + 1, kz + 2, kz), the first two swapped when d[kz] < 0
+            let perm = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] {
+                let x = lw.sel(kz1, v[2], v[0]);
+                let x = lw.sel(kz0, v[1], x);
+                let y = lw.sel(kz1, v[0], v[1]);
+                let y = lw.sel(kz0, v[2], y);
+                let z = lw.sel(kz1, v[1], v[2]);
+                let z = lw.sel(kz0, v[0], z);
+                [x, y, z]
+            };
+            let pd = perm(lw, dir);
             let z = lw.fc(0.0);
+            let sw = lw.fcmp(Pred::FOLt, pd[2], z);
+            let swap = |lw: &mut Lw, v: [Value; 3]| -> [Value; 3] { [lw.sel(sw, v[1], v[0]), lw.sel(sw, v[0], v[1]), v[2]] };
+            let pd = swap(lw, pd);
+            let one = lw.fc(1.0);
+            let sz = lw.fdiv(one, pd[2]);
+            let sx = lw.fmul(pd[0], sz);
+            let sy = lw.fmul(pd[1], sz);
+            let mut sh = [[z; 3]; 3];
+            for (k, v) in [v0, v1, v2].into_iter().enumerate() {
+                let r = lw.f3(v, o, Lw::fsub);
+                let r = perm(lw, r);
+                let r = swap(lw, r);
+                let ax = lw.fmul(sx, r[2]);
+                let ay = lw.fmul(sy, r[2]);
+                sh[k] = [lw.fsub(r[0], ax), lw.fsub(r[1], ay), lw.fmul(sz, r[2])];
+            }
+            let [p0, p1, p2] = sh;
+            let edge = |lw: &mut Lw, a: [Value; 3], b: [Value; 3]| {
+                let m0 = lw.fmul(a[0], b[1]);
+                let m1 = lw.fmul(a[1], b[0]);
+                lw.fsub(m0, m1)
+            };
+            let u = edge(lw, p2, p1);
+            let i = edge(lw, p0, p2);
+            let j = edge(lw, p1, p0);
+            let mut neg = lw.fcmp(Pred::FOLt, u, z);
+            let mut pos = lw.fcmp(Pred::FOGt, u, z);
+            for e in [i, j] {
+                let n = lw.fcmp(Pred::FOLt, e, z);
+                neg = lw.lor(neg, n);
+                let p = lw.fcmp(Pred::FOGt, e, z);
+                pos = lw.lor(pos, p);
+            }
+            let mixed = lw.land(neg, pos);
             let ij = lw.fadd(i, j);
+            let det = lw.fadd(u, ij);
+            let tu = lw.fmul(u, p0[2]);
+            let ti = lw.fmul(i, p1[2]);
+            let tj = lw.fmul(j, p2[2]);
+            let t = lw.fadd(tu, ti);
+            let t = lw.fadd(t, tj);
+            // edge-on (det = 0) and NaN miss
             let dpos = lw.fcmp(Pred::FOGt, det, z);
-            let c1 = lw.fcmp(Pred::FOGe, i, z);
-            let c2 = lw.fcmp(Pred::FOGe, j, z);
-            let c3 = lw.fcmp(Pred::FOLe, ij, det);
-            let hp = lw.land(c1, c2);
-            let hp = lw.land(hp, c3);
             let dneg = lw.fcmp(Pred::FOLt, det, z);
-            let n1 = lw.fcmp(Pred::FOLe, i, z);
-            let n2 = lw.fcmp(Pred::FOLe, j, z);
-            let n3 = lw.fcmp(Pred::FOGe, ij, det);
-            let hn = lw.land(dneg, n1);
-            let hn = lw.land(hn, n2);
-            let hn = lw.land(hn, n3);
-            let hit = lw.sel(dpos, hp, hn);
+            let dnz = lw.lor(dpos, dneg);
+            let inside = lw.lnot(mixed);
+            let hit = lw.land(inside, dnz);
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];

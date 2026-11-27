@@ -237,15 +237,53 @@ fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
+#[cfg(test)]
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
+#[cfg(test)]
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-/// Möller–Trumbore as the triangle node returns it: (t·det, det, i·det, j·det), `None` = miss
+/// The triangle node's test as it returns it: (t·det, det, i·det, j·det), `None` = miss.
+/// Watertight (Woop, Benthin, Wald, "Watertight Ray/Triangle Intersection", JCGT 2013): the
+/// vertices are sheared so the ray runs along its largest axis and the signs of the three edge
+/// functions decide, so a ray through an edge two triangles share hits at least one of them
+/// (both when the edge function is exactly 0; the console's rule for that tie is not known).
+/// Edge-on (det = 0) and NaN miss; t is not tested here (the traversal does). The HLSL prelude
+/// (`recomp/emit.rs` `bvh_intersect`) and the DXIL lowering (`dxil/lower_image.rs`) do the same
+/// operations in the same order.
+///
+/// Adapted from victory-fork (https://github.com/fxceless/victory-fork, GPL-3.0-or-later),
+/// `crates/victory-shader/src/bvh.rs` `triangle`, which follows the software emulation of this
+/// instruction in Mesa RADV (https://gitlab.freedesktop.org/mesa/mesa, MIT). Changed 2026-11:
+/// no t sign test, XCL's result encoding.
 pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+    let a = d.map(f32::abs);
+    // largest axis, then the other two in the order that keeps the winding
+    let kz = if a[0] >= a[1] { if a[0] >= a[2] { 0 } else { 2 } } else if a[1] >= a[2] { 1 } else { 2 };
+    let (kx, ky) = if d[kz] < 0.0 { ((kz + 2) % 3, (kz + 1) % 3) } else { ((kz + 1) % 3, (kz + 2) % 3) };
+    let sz = 1.0 / d[kz];
+    let (sx, sy) = (d[kx] * sz, d[ky] * sz);
+    let shear = |p: [f32; 3]| {
+        let r = sub(p, o);
+        [r[kx] - sx * r[kz], r[ky] - sy * r[kz], sz * r[kz]]
+    };
+    let (p0, p1, p2) = (shear(v[0]), shear(v[1]), shear(v[2]));
+    // edge functions: the barycentric numerators of v0, v1, v2
+    let u = p2[0] * p1[1] - p2[1] * p1[0];
+    let i = p0[0] * p2[1] - p0[1] * p2[0];
+    let j = p1[0] * p0[1] - p1[1] * p0[0];
+    let mixed = (u < 0.0 || i < 0.0 || j < 0.0) && (u > 0.0 || i > 0.0 || j > 0.0);
+    let det = u + (i + j);
+    let t = (u * p0[2] + i * p1[2]) + j * p2[2];
+    (!mixed && (det > 0.0 || det < 0.0)).then_some([t, det, i, j])
+}
+
+/// The Möller–Trumbore test XCL used before the watertight one (tests compare against it).
+#[cfg(test)]
+fn triangle_hit_mt(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
     let (e1, e2) = (sub(v[1], v[0]), sub(v[2], v[0]));
     let p = cross(d, e2);
     let det = dot(e1, p);
@@ -669,5 +707,145 @@ pub(crate) mod tests {
         // Type 3 must miss a ray aimed at type 0's interior (1.0, 0.5)
         let miss3 = intersect_node(&data, 3, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
         assert!(miss3[0].is_infinite());
+    }
+
+    /// `p` rotated so that its axis 2 becomes `axis`, mirrored when `flip`
+    fn place(p: [f32; 3], axis: usize, flip: bool) -> [f32; 3] {
+        let mut r = [0.0; 3];
+        for k in 0..3 {
+            r[(axis + 1 + k) % 3] = p[k];
+        }
+        if flip {
+            r[axis] = -r[axis];
+        }
+        r
+    }
+
+    /// hits among `tris` for a ray from `o` along `d`
+    fn hits(tris: &[Triangle], o: [f32; 3], d: [f32; 3]) -> usize {
+        tris.iter().filter(|t| triangle_hit(t, o, d).is_some()).count()
+    }
+
+    /// Rays exactly through the edge two triangles share and through the vertex a fan shares:
+    /// at least one triangle hits, along every dominant axis, both ray signs and windings.
+    #[test]
+    fn triangle_hit_is_watertight_at_shared_edges_and_vertices() {
+        let mut r = rng(11);
+        let mut checked = 0;
+        for axis in 0..3 {
+            for flip in [false, true] {
+                for _ in 0..200 {
+                    // a quad split along a random diagonal, in a plane across the ray's main axis
+                    let z = r(-2.0, 2.0);
+                    let (a, b) = ([r(-3.0, -1.0), r(-1.0, 1.0), z], [r(1.0, 3.0), r(-1.0, 1.0), z]);
+                    let (c, e) = ([r(-3.0, 3.0), r(8.0, 10.0), z + r(-0.5, 0.5)], [r(-3.0, 3.0), r(-10.0, -8.0), z + r(-0.5, 0.5)]);
+                    let pair = [[a, b, c], [b, a, e]].map(|t| t.map(|p| place(p, axis, flip)));
+                    let s = r(0.0, 1.0);
+                    let on = [0, 1, 2].map(|k| a[k] + s * (b[k] - a[k]));
+                    // ray from below, tilted but still mostly along the axis
+                    let dir = [r(-0.3, 0.3), r(-0.3, 0.3), if r(0.0, 1.0) < 0.5 { 1.0 } else { -1.0 }];
+                    let o = [0, 1, 2].map(|k| on[k] - 4.0 * dir[k]);
+                    let (o, dir) = (place(o, axis, flip), place(dir, axis, flip));
+                    assert!(hits(&pair, o, dir) >= 1, "edge: axis {axis} flip {flip} {pair:?} o {o:?} d {dir:?}");
+                    // fan of 6 around a shared vertex, ray straight through it
+                    let v = [r(-1.0, 1.0), r(-1.0, 1.0), z];
+                    let ring: Vec<[f32; 3]> = (0..6)
+                        .map(|k| {
+                            let ang = k as f32 * std::f32::consts::TAU / 6.0 + r(0.0, 0.3);
+                            [v[0] + 2.0 * ang.cos(), v[1] + 2.0 * ang.sin(), z + r(-0.5, 0.5)]
+                        })
+                        .collect();
+                    let fan: Vec<Triangle> = (0..6).map(|k| [v, ring[k], ring[(k + 1) % 6]].map(|p| place(p, axis, flip))).collect();
+                    let o = [0, 1, 2].map(|k| v[k] - 4.0 * dir_local(dir, axis, flip)[k]);
+                    let o = place(o, axis, flip);
+                    assert!(hits(&fan, o, dir) >= 1, "vertex: axis {axis} flip {flip} o {o:?} d {dir:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 1200);
+    }
+
+    /// inverse of `place` for a direction
+    fn dir_local(d: [f32; 3], axis: usize, flip: bool) -> [f32; 3] {
+        let mut d = d;
+        if flip {
+            d[axis] = -d[axis];
+        }
+        [0, 1, 2].map(|k| d[(axis + 1 + k) % 3])
+    }
+
+    /// Away from edges the watertight test agrees with the old Möller–Trumbore one: same hit /
+    /// miss, same sign of det (facing), t and barycentrics within rounding.
+    #[test]
+    fn triangle_hit_agrees_with_moller_trumbore_on_generic_rays() {
+        for seed in 0..8u64 {
+            let tris = random_tris(50, 200 + seed);
+            let mut r = rng(300 + seed);
+            let mut both = 0;
+            for _ in 0..2000 {
+                let o = [r(-12.0, 12.0), r(-12.0, 12.0), r(-12.0, 12.0)];
+                let to = [r(-8.0, 8.0), r(-8.0, 8.0), r(-8.0, 8.0)];
+                let d = sub(to, o);
+                for t in &tris {
+                    let (w, m) = (triangle_hit(t, o, d), triangle_hit_mt(t, o, d));
+                    let Some(m) = m else {
+                        if let Some(w) = w {
+                            // only a ray within rounding of an edge may differ
+                            assert!([w[2], w[3], w[1] - w[2] - w[3]].iter().any(|x| (x / w[1]).abs() < 1e-4), "{t:?} {o:?} {d:?}: {w:?}");
+                        }
+                        continue;
+                    };
+                    let Some(w) = w else {
+                        assert!([m[2], m[3], m[1] - m[2] - m[3]].iter().any(|x| (x / m[1]).abs() < 1e-4), "{t:?} {o:?} {d:?}: {m:?}");
+                        continue;
+                    };
+                    assert_eq!(w[1] > 0.0, m[1] > 0.0, "facing");
+                    for k in [0, 2, 3] {
+                        assert!((w[k] / w[1] - m[k] / m[1]).abs() < 1e-4, "{k}: {w:?} vs {m:?}");
+                    }
+                    both += 1;
+                }
+            }
+            assert!(both > 100, "seed {seed}: {both} hits");
+        }
+    }
+
+    /// Degenerate triangles, rays in the triangle's plane, a zero direction and NaN miss.
+    #[test]
+    fn triangle_hit_degenerate_and_parallel_miss() {
+        let d = [0.0, 0.0, 1.0];
+        let o = [0.2, 0.2, -1.0];
+        let tri = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let degenerate: [Triangle; 3] = [
+            [[0.0; 3], [0.0; 3], [0.0; 3]],
+            [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]],
+            [[0.2, 0.2, 0.0], [0.2, 0.2, 0.0], [1.0, 0.0, 0.0]],
+        ];
+        for t in &degenerate {
+            assert!(triangle_hit(t, o, d).is_none(), "{t:?}");
+        }
+        // in the plane, along each in-plane axis and a diagonal
+        for d in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 0.0, 0.0]] {
+            assert!(triangle_hit(&tri, [-1.0, 0.2, 0.0], d).is_none(), "{d:?}");
+        }
+        assert!(triangle_hit(&tri, o, [0.0; 3]).is_none());
+        assert!(triangle_hit(&tri, o, [f32::NAN, 0.0, 1.0]).is_none());
+        assert!(triangle_hit(&tri, [f32::NAN, 0.2, -1.0], d).is_none());
+        let mut nan = tri;
+        nan[1][0] = f32::NAN;
+        assert!(triangle_hit(&nan, o, d).is_none());
+        // the node returns its miss encoding, never a NaN
+        for t in degenerate.iter().chain([&nan]) {
+            let mut data = vec![0u8; 64];
+            for (k, p) in t.iter().enumerate() {
+                for a in 0..3 {
+                    data[12 * k + 4 * a..12 * k + 4 * a + 4].copy_from_slice(&p[a].to_le_bytes());
+                }
+            }
+            data[60..64].copy_from_slice(&TRI_ID_PLAIN.to_le_bytes());
+            let r = intersect_node(&data, 0, 100.0, o, d, d.map(|x| 1.0 / x), false).map(f32::from_bits);
+            assert_eq!(r, [f32::INFINITY, 1.0, 0.0, 0.0]);
+        }
     }
 }

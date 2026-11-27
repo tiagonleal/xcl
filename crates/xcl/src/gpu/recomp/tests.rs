@@ -5594,6 +5594,74 @@ fn gpu_triangle_pair_and_box16_nodes() {
     assert!(checked > 5, "{checked} triangle hits");
 }
 
+/// Watertight triangle test on the GPU: rays exactly through the edge a triangle pair shares
+/// (type 0 = (v0, v1, v2) and type 1 = (v1, v3, v2) share v1–v2), along each axis and both
+/// signs. Each ray goes to both triangles in neighbouring lanes: at least one hits, and hit /
+/// miss is the CPU's.
+#[test]
+fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    // one skewed quad across each axis: v1 = (-1.3, 0.7), v2 = (1.1, -0.9) in the other two axes
+    let quad = [[-1.7f32, -1.9, 0.0], [-1.3, 0.7, 0.2], [1.1, -0.9, -0.1], [1.6, 1.8, 0.3]];
+    let at = |axis: usize, p: [f32; 3]| {
+        let mut r = [0.0f32; 3];
+        r[(axis + 1) % 3] = p[0];
+        r[(axis + 2) % 3] = p[1];
+        r[axis] = 5.0 + p[2];
+        r
+    };
+    for axis in 0..3 {
+        let verts: Vec<f32> = quad.iter().flat_map(|&p| at(axis, p)).collect();
+        w(&mut mem, 0x40 * (axis + 1), &ff(&verts));
+        w(&mut mem, 0x40 * (axis + 1) + 48, &[0x80, 0, 1, 0x0909]);
+    }
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let mut r = bvh::tests::rng(23);
+    let mut rays = vec![];
+    let mut ray = ([0.0f32; 3], [0.0f32; 3], 0usize);
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        if l % 2 == 0 {
+            let axis = (l / 2) % 3;
+            let s = r(0.0, 1.0);
+            let (v1, v2) = (at(axis, quad[1]), at(axis, quad[2]));
+            let on = [0, 1, 2].map(|a| v1[a] + s * (v2[a] - v1[a]));
+            let mut d = [r(-0.4, 0.4), r(-0.4, 0.4), r(-0.4, 0.4)];
+            d[axis] = if (l / 6) % 2 == 0 { 1.0 } else { -1.0 };
+            ray = ([0, 1, 2].map(|a| on[a] - 3.0 * d[a]), d, axis);
+        }
+        let (o, d, axis) = ray;
+        let inv = d.map(|x| 1.0 / x);
+        let node = ((0x40 * (axis as u32 + 1)) >> 3) | (l as u32 % 2);
+        v[0] = node;
+        for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + k] = x.to_bits();
+        }
+        rays.push((node, o, d, inv));
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    // GPU and CPU may round 1 / d differently, so on the edge each is checked on its own
+    let (mut gh, mut ch) = ([false; 2], [false; 2]);
+    for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
+        gh[l % 2] = f32::from_bits(res.vgpr[l][100]).is_finite();
+        ch[l % 2] = f32::from_bits(bvh::intersect_node(&data, node, 100.0, o, d, inv, true)[0]).is_finite();
+        if l % 2 == 1 {
+            assert!(gh[0] || gh[1], "lanes {} and {l}: GPU ray through the shared edge missed both", l - 1);
+            assert!(ch[0] || ch[1], "lanes {} and {l}: CPU ray through the shared edge missed both", l - 1);
+        }
+    }
+}
+
 /// Multi-window `image_bvh64_intersect_ray` (full 64-bit node pointer into UMA window 1 with
 /// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN-disabled box.
 #[test]
