@@ -1977,6 +1977,12 @@ mod tests {
             backing.submit_pins = 0;
         }
         sweep_release_owners_with(drop, drop);
+        // Tests running in parallel sweep the same STATE (e.g. through `forget`), so another thread
+        // can take this retired backing first and release it just after our sweep returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while object.releases.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert_eq!(
             (object.refs.load(Ordering::Acquire), object.releases.load(Ordering::Acquire)),
             (0, 1),
