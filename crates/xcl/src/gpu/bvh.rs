@@ -286,9 +286,10 @@ fn triangle_hit_watertight(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f3
     let (kx, ky) = if d[kz] < 0.0 { ((kz + 2) % 3, (kz + 1) % 3) } else { ((kz + 1) % 3, (kz + 2) % 3) };
     let sz = 1.0 / d[kz];
     let (sx, sy) = (d[kx] * sz, d[ky] * sz);
+    // (x, y) sheared, z the unscaled axial distance from the origin
     let shear = |p: [f32; 3]| {
         let r = sub(p, o);
-        [r[kx] - sx * r[kz], r[ky] - sy * r[kz], sz * r[kz]]
+        [r[kx] - sx * r[kz], r[ky] - sy * r[kz], r[kz]]
     };
     let (p0, p1, p2) = (shear(v[0]), shear(v[1]), shear(v[2]));
     // edge functions: the barycentric numerators of v0, v1, v2
@@ -297,12 +298,24 @@ fn triangle_hit_watertight(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f3
     let j = p1[0] * p0[1] - p1[1] * p0[0];
     let mixed = (u < 0.0 || i < 0.0 || j < 0.0) && (u > 0.0 || i > 0.0 || j > 0.0);
     let det = u + (i + j);
-    let t = (u * p0[2] + i * p1[2]) + j * p2[2];
+    // Möller–Trumbore's t·det is the depth sum over the sheared det times |d[kz]| / d[kz]:
+    // with the unscaled depths only d[kz]'s sign is left (exact), so nothing overflows that
+    // the old t·det does not
+    let tz = (u * p0[2] + i * p1[2]) + j * p2[2];
+    let t = if d[kz] < 0.0 { -tz } else { tz };
     // back to Möller–Trumbore's scale (the sheared determinant is its det / |d[kz]|), after
-    // the decision; a non-finite t or det (tiny d[kz], huge shear) misses
+    // the decision
     let s = d[kz].abs();
-    let r = [t * s, det * s, i * s, j * s];
-    (!mixed && (det > 0.0 || det < 0.0) && r[0].is_finite() && r[1].is_finite()).then_some(r)
+    let r = [t, det * s, i * s, j * s];
+    // the plane's own orientation (Möller–Trumbore's det, as `triangle_hit_mt`) must agree with
+    // the sheared det's sign: a ray in (or within rounding of) the plane misses even when the
+    // rounded sheared det is not 0
+    let mt = dot(sub(v[1], v[0]), cross(d, sub(v[2], v[0])));
+    let facing = (det > 0.0 && mt > 0.0) || (det < 0.0 && mt < 0.0);
+    // the traversal divides by the encoded det: a normal number, so never 0 (also where a GPU
+    // flushes subnormals); a non-finite t or det misses
+    let normal = r[1].abs() >= f32::MIN_POSITIVE;
+    (!mixed && facing && normal && r[0].is_finite() && r[1].is_finite()).then_some(r)
 }
 
 /// The ray's largest axis (ties: x before y before z), along which `triangle_hit` shears.
@@ -846,8 +859,8 @@ pub(crate) mod tests {
     }
 
     /// The watertight test's edge cases: degenerate triangles, rays in the triangle's plane, a
-    /// zero direction and NaN miss; a tiny largest component with a far triangle overflows the
-    /// sheared depth and misses; the node then returns its miss encoding, never a NaN. Equal
+    /// zero direction and NaN miss; a tiny largest component (1e-38) gives a subnormal
+    /// encoded det and misses; the node then returns its miss encoding, never a NaN. Equal
     /// largest components pick the first axis (x before y before z), as the HLSL and DXIL `kz`.
     #[test]
     fn triangle_hit_degenerate_non_finite_and_axis_ties() {
@@ -892,6 +905,40 @@ pub(crate) mod tests {
         for (d, k) in [([1.0, -1.0, 0.5], 0), ([-1.0, 1.0, 1.0], 0), ([0.5, 1.0, -1.0], 1), ([0.5, -0.25, 1.0], 2), ([0.0; 3], 0)] {
             assert_eq!(dominant_axis(d), k, "{d:?}");
         }
+    }
+
+    /// Review cases of #3038 (finite binary32 inputs; `p` = 2^p):
+    /// 1. a ray in the triangle's plane (Möller–Trumbore's det is exactly 0) whose rounded
+    ///    sheared determinant is not 0 misses;
+    /// 2. a finite interior hit whose weighted sheared depths overflow (tiny d[kz]) still hits,
+    ///    with Möller–Trumbore's values;
+    /// 3. a hit whose encoded determinant (sheared det · |d[kz]|) rounds to 0 misses, so the
+    ///    traversal never divides by a zero denominator.
+    pub(crate) fn review_cases() -> [(Triangle, [f32; 3], [f32; 3]); 3] {
+        let p = |e: i32| 2f32.powi(e);
+        [
+            ([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [4.0, 5.0, 6.0]], [-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]),
+            ([[0.0, 0.0, p(20)], [p(30), 0.0, p(20)], [0.0, p(30), p(20)]], [p(28), p(28), 0.0], [0.0, 0.0, p(-60)]),
+            ([[0.0, 0.0, 1.0], [p(-40), 0.0, 1.0], [0.0, p(-40), 1.0]], [p(-42), p(-42), 0.0], [0.0, 0.0, p(-80)]),
+        ]
+    }
+
+    #[test]
+    fn triangle_hit_review_cases_coplanar_overflow_zero_denominator() {
+        let [c1, c2, c3] = review_cases();
+        for (k, (t, o, d)) in review_cases().iter().enumerate() {
+            eprintln!("case {}: watertight {:?} mt {:?}", k + 1, triangle_hit_watertight(t, *o, *d), triangle_hit_mt(t, *o, *d));
+        }
+        assert_eq!(triangle_hit_mt(&c1.0, c1.1, c1.2), None);
+        assert_eq!(triangle_hit_watertight(&c1.0, c1.1, c1.2), None, "coplanar ray");
+        let p = |e: i32| 2f32.powi(e);
+        assert_eq!(triangle_hit_mt(&c2.0, c2.1, c2.2), Some([-p(80), -1.0, -0.25, -0.25]));
+        assert_eq!(triangle_hit_watertight(&c2.0, c2.1, c2.2), Some([-p(80), -1.0, -0.25, -0.25]), "overflowed depth");
+        assert_eq!(triangle_hit_watertight(&c3.0, c3.1, c3.2), None, "zero denominator");
+        // the same small triangle with a unit direction is a valid hit and still hits
+        let unit = [0.0, 0.0, 1.0];
+        assert_eq!(triangle_hit_watertight(&c3.0, c3.1, unit), triangle_hit_mt(&c3.0, c3.1, unit));
+        assert!(triangle_hit_watertight(&c3.0, c3.1, unit).is_some());
     }
 
     thread_local! {

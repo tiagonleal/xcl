@@ -257,7 +257,8 @@ impl Lw {
                     let r = swap(lw, r);
                     let ax = lw.fmul(sx, r[2]);
                     let ay = lw.fmul(sy, r[2]);
-                    sh[k] = [lw.fsub(r[0], ax), lw.fsub(r[1], ay), lw.fmul(sz, r[2])];
+                    // (x, y) sheared, z the unscaled axial distance from the origin
+                    sh[k] = [lw.fsub(r[0], ax), lw.fsub(r[1], ay), r[2]];
                 }
                 let [p0, p1, p2] = sh;
                 let edge = |lw: &mut Lw, a: [Value; 3], b: [Value; 3]| {
@@ -284,17 +285,37 @@ impl Lw {
                 let tj = lw.fmul(j, p2[2]);
                 let t = lw.fadd(tu, ti);
                 let t = lw.fadd(t, tj);
-                // back to Möller–Trumbore's scale after the decision; edge-on (det = 0), NaN and a
-                // non-finite t or det miss
+                // Möller–Trumbore's t·det: the unscaled depth sum with d[kz]'s sign
+                let tn = lw.fneg(t);
+                let t = lw.sel(sw, tn, t);
+                // the plane's orientation (Möller–Trumbore's det, gpu::bvh order) must agree
+                // with the sheared det's sign; edge-on, NaN miss
+                let e1 = lw.f3(v1, v0, Lw::fsub);
+                let e2 = lw.f3(v2, v0, Lw::fsub);
+                let c = lw.cross(dir, e2);
+                let m0 = lw.fmul(e1[0], c[0]);
+                let m1 = lw.fmul(e1[1], c[1]);
+                let m2 = lw.fmul(e1[2], c[2]);
+                let mt = lw.fadd(m0, m1);
+                let mt = lw.fadd(mt, m2);
                 let dpos = lw.fcmp(Pred::FOGt, det, z);
                 let dneg = lw.fcmp(Pred::FOLt, det, z);
-                let dnz = lw.lor(dpos, dneg);
+                let mpos = lw.fcmp(Pred::FOGt, mt, z);
+                let mneg = lw.fcmp(Pred::FOLt, mt, z);
+                let fp = lw.land(dpos, mpos);
+                let fneg = lw.land(dneg, mneg);
+                let facing = lw.lor(fp, fneg);
                 let inside = lw.lnot(mixed);
-                let hit = lw.land(inside, dnz);
+                let hit = lw.land(inside, facing);
+                // back to Möller–Trumbore's scale after the decision; the encoded det is a normal
+                // number (never 0 for the traversal), a non-finite t or det misses
                 let s = lw.fabs(pd[2]);
-                let (t, det, i, j) = (lw.fmul(t, s), lw.fmul(det, s), lw.fmul(i, s), lw.fmul(j, s));
+                let (det, i, j) = (lw.fmul(det, s), lw.fmul(i, s), lw.fmul(j, s));
+                let adet = lw.fabs(det);
+                let fmin = lw.fc(f32::MIN_POSITIVE);
+                let normal = lw.fcmp(Pred::FOGe, adet, fmin);
                 let pinf = lw.fc(f32::INFINITY);
-                let mut hit = hit;
+                let mut hit = lw.land(hit, normal);
                 for x in [t, det] {
                     // |x| < inf is false for inf and NaN
                     let ax = lw.fabs(x);

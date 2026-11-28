@@ -5677,6 +5677,52 @@ fn gpu_bvh_triangle_pair_shared_edge_is_watertight() {
     assert!(mt(n0).is_infinite() && mt(n1).is_infinite(), "Möller–Trumbore hits the pinned pair");
 }
 
+/// The #3038 review cases (`bvh::tests::review_cases`: coplanar ray, overflowing sheared depth,
+/// zero encoded denominator) plus the small triangle with a unit direction, one per lane, with
+/// the watertight test on the GPU (HLSL, or the direct DXIL with `XCL_DIRECT_DXIL=1`): the node
+/// result is the CPU reference's bit for bit, and hit / miss is as the review expects.
+#[test]
+fn gpu_bvh_watertight_review_cases_match_the_cpu() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let [c1, c2, c3] = bvh::tests::review_cases();
+    let cases = [(c1, false), (c2, true), (c3, false), ((c3.0, c3.1, [0.0, 0.0, 1.0]), true)];
+    for (k, ((tri, _, _), _)) in cases.iter().enumerate() {
+        let v: Vec<u32> = tri.concat().iter().map(|x| x.to_bits()).collect();
+        w(&mut mem, 0x40 * (k + 1), &v);
+        w(&mut mem, 0x40 * (k + 1) + 48, &[0, 0, 1, 0x0909]);
+    }
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let lane = |l: usize| (l % cases.len(), (0x40 * (l % cases.len() as usize + 1) as u32) >> 3);
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        let (k, node) = lane(l);
+        let ((_, o, d), _) = cases[k];
+        let inv = d.map(|x| 1.0 / x);
+        v[0] = node;
+        for (n, x) in [f32::MAX, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + n] = x.to_bits();
+        }
+    }
+    let res = bvh::tests::with_watertight(true, || runner::run_code(&code, &st, &mem)).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    for l in 0..cases.len() {
+        let (k, node) = lane(l);
+        let ((_, o, d), hit) = cases[k];
+        let cpu = bvh::tests::with_watertight(true, || bvh::intersect_node(&data, node, f32::MAX, o, d, d.map(|x| 1.0 / x), true));
+        let gpu: [u32; 4] = res.vgpr[l][100..104].try_into().unwrap();
+        assert_eq!(gpu, cpu, "case {}: GPU {:?} CPU {:?}", k + 1, gpu.map(f32::from_bits), cpu.map(f32::from_bits));
+        assert_eq!(f32::from_bits(cpu[0]).is_finite(), hit, "case {}: {:?}", k + 1, cpu.map(f32::from_bits));
+    }
+}
+
 /// `XCL_BVH_WATERTIGHT` selects the triangle test in the HLSL and in the direct DXIL. Off, the
 /// HLSL has main's Möller–Trumbore text and nothing of the switch (DXC cache keys unchanged);
 /// on, only a program that calls `bvh_intersect` changes.
